@@ -387,6 +387,8 @@ async function loadDecoder(){
     const f = new FFmpegWASM.FFmpeg();
     const root = location.origin + "/ff/";
     await f.load({ coreURL: root + "ffmpeg-core.js", wasmURL: root + "ffmpeg-core.wasm" });
+    // A throwaway first run settles the decoder; without it the first real run can crash.
+    try { await f.exec(["-hide_banner", "-i", "not-found"]); } catch (e) {}
     ff = f;
     return f;
   })();
@@ -402,8 +404,34 @@ async function clipPath(c){
   }
   return c.mounted;
 }
+// The decoder gets unstable after many runs, so it is restarted every so often and after any crash.
+let ffRuns = 0;
+async function resetDecoder(){
+  try { if (ff) ff.terminate(); } catch (e) {}
+  ff = null; ffLoading = null; ffRuns = 0;
+  for (const c of clips) c.mounted = null;
+  await loadDecoder();
+}
 let ffQueue = Promise.resolve();
-function ffRun(job){ const p = ffQueue.then(job); ffQueue = p.catch(() => {}); return p; }
+function ffRun(job){
+  const safe = async () => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++){
+      try {
+        if (ffRuns >= 12) await resetDecoder();
+        ffRuns++;
+        return await job();
+      } catch (e){
+        lastErr = e;
+        await resetDecoder();
+      }
+    }
+    throw new Error("Decoder: " + (lastErr && lastErr.message ? lastErr.message : lastErr));
+  };
+  const p = ffQueue.then(safe);
+  ffQueue = p.catch(() => {});
+  return p;
+}
 
 function evenSize(w, c){
   let h = Math.round(w * c.video.videoHeight / c.video.videoWidth) || Math.round(w * 9 / 16);
@@ -472,7 +500,9 @@ async function detectCars(W, H, conf){
     input[p] = px[q] / 255; input[p + area] = px[q + 1] / 255; input[p + 2 * area] = px[q + 2] / 255;
   }
   const feeds = {}; feeds[session.inputNames[0]] = new ort.Tensor("float32", input, [1, 3, S, S]);
-  const out = await session.run(feeds);
+  let out;
+  try { out = await session.run(feeds); }
+  catch (e){ throw new Error("Car model: " + (e && e.message ? e.message : e)); }
   let det = null, proto = null;
   for (const k of session.outputNames){ const t = out[k]; if (t.dims.length === 3) det = t; else if (t.dims.length === 4) proto = t; }
   const dd = det.data, pd = proto.data;
