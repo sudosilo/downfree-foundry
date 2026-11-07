@@ -94,6 +94,7 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script src="ff/ffmpeg.js"></script>
 <script>
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
 ort.env.wasm.numThreads = 1;
@@ -197,7 +198,7 @@ $("files").addEventListener("change", async e => {
   for (const f of list){
     try {
       const v = await loadClip(f);
-      clips.push({ name: f.name, video: v, offset: 0, enabled: true, thumb: null, range: null, num: null });
+      clips.push({ id: nextClipId++, file: f, mounted: null, name: f.name, video: v, offset: 0, enabled: true, thumb: null, range: null, num: null });
     } catch (err){ setStatus(err.message); }
   }
   e.target.value = "";
@@ -295,16 +296,19 @@ async function updateAlign(){
   do {
     alignAgain = false;
     const base = clips[baseIdx];
-    const W = 640, H = Math.round(W * base.video.videoHeight / base.video.videoWidth) || 360;
+    const W = 480, H = evenSize(W, base);
     alignA.width = W; alignA.height = H; alignB.width = W; alignB.height = H;
-    await seekTo(base.video, base.offset);
-    await drawVideo(base.video, alignA.getContext("2d"), W, H);
     const other = clips[selectedIdx];
     hasB = !!(other && selectedIdx !== baseIdx);
-    if (hasB){
-      await seekTo(other.video, other.offset);
-      await drawVideo(other.video, alignB.getContext("2d"), W, H);
-    }
+    try {
+      const a = await grabFrame(base, base.offset, W, H);
+      alignA.getContext("2d").drawImage(a, 0, 0); a.close();
+      if (hasB){
+        const b = await grabFrame(other, other.offset, W, H);
+        alignB.getContext("2d").drawImage(b, 0, 0); b.close();
+      }
+      if (!busy) setStatus(clips.length + " clips ready.");
+    } catch (err){ setStatus("Could not read frames: " + (err && err.message ? err.message : err)); }
     $("alignCard").hidden = false;
     paintAlign();
   } while (alignAgain);
@@ -318,8 +322,9 @@ const sigCanvas = document.createElement("canvas");
 sigCanvas.width = SIG_W; sigCanvas.height = SIG_H;
 const sigCtx = sigCanvas.getContext("2d", { willReadFrequently: true });
 
-function signature(v){
-  sigCtx.drawImage(v, 0, 0, SIG_W, SIG_H);
+function signature(img){
+  sigCtx.drawImage(img, 0, 0, SIG_W, SIG_H);
+  if (img.close) img.close();
   const d = sigCtx.getImageData(0, 0, SIG_W, SIG_H).data;
   // edge strength image, so different sun and sky on different days matter less
   const g = new Float32Array(SIG_W * SIG_H);
@@ -342,8 +347,7 @@ $("autoBtn").addEventListener("click", async () => {
   busy = true; $("autoBtn").disabled = true; $("buildBtn").disabled = true;
   try {
     const base = clips[baseIdx];
-    await seekTo(base.video, base.offset);
-    const ref = signature(base.video);
+    const ref = signature(await grabFrame(base, base.offset, SIG_W, SIG_H));
     const others = clips.map((_, k) => k).filter(k => k !== baseIdx);
     for (let n = 0; n < others.length; n++){
       const c = clips[others[n]];
@@ -351,8 +355,7 @@ $("autoBtn").addEventListener("click", async () => {
       const step = dur > 120 ? 2 : dur > 30 ? 1 : 0.25;
       let best = Infinity, bestT = 0;
       for (let t = 0; t < dur - 0.1; t += step){
-        await seekTo(c.video, t);
-        const sc = diff(ref, signature(c.video));
+        const sc = diff(ref, signature(await grabFrame(c, t, SIG_W, SIG_H)));
         if (sc < best){ best = sc; bestT = t; }
         setStatus("Lining up clip " + (others[n] + 1) + ": " + Math.round(100 * t / dur) + "%");
       }
@@ -360,8 +363,7 @@ $("autoBtn").addEventListener("click", async () => {
       for (const fine of [0.25, 0.1]){
         const center = bestT, span = fine === 0.25 ? step : 0.25;
         for (let t = Math.max(0, center - span); t <= Math.min(dur - 0.1, center + span); t += fine){
-          await seekTo(c.video, t);
-          const sc = diff(ref, signature(c.video));
+          const sc = diff(ref, signature(await grabFrame(c, t, SIG_W, SIG_H)));
           if (sc < best){ best = sc; bestT = t; }
         }
       }
@@ -375,6 +377,69 @@ $("autoBtn").addEventListener("click", async () => {
   }
   updateAlign();
 });
+
+// Frames come from a video decoder that runs inside the page, so the browser's video player is only used for previews.
+let ff = null, ffLoading = null, nextClipId = 0;
+async function loadDecoder(){
+  if (ff) return ff;
+  if (!ffLoading) ffLoading = (async () => {
+    setStatus("Loading video decoder (about 32 MB, first time only)...");
+    const f = new FFmpegWASM.FFmpeg();
+    const root = location.origin + "/ff/";
+    await f.load({ coreURL: root + "ffmpeg-core.js", wasmURL: root + "ffmpeg-core.wasm" });
+    ff = f;
+    return f;
+  })();
+  try { return await ffLoading; } catch (e){ ffLoading = null; throw e; }
+}
+async function clipPath(c){
+  await loadDecoder();
+  if (!c.mounted){
+    const dir = "/in" + c.id;
+    try { await ff.createDir(dir); } catch (e) {}
+    await ff.mount("WORKERFS", { files: [c.file] }, dir);
+    c.mounted = dir + "/" + c.file.name;
+  }
+  return c.mounted;
+}
+let ffQueue = Promise.resolve();
+function ffRun(job){ const p = ffQueue.then(job); ffQueue = p.catch(() => {}); return p; }
+
+function evenSize(w, c){
+  let h = Math.round(w * c.video.videoHeight / c.video.videoWidth) || Math.round(w * 9 / 16);
+  return h - (h % 2);
+}
+
+// One frame from a clip at time t, as an ImageBitmap of size w by h.
+function grabFrame(c, t, w, h){
+  return ffRun(async () => {
+    const path = await clipPath(c);
+    const out = "/grab.jpg";
+    await ff.exec(["-ss", Math.max(0, t).toFixed(3), "-i", path, "-frames:v", "1", "-vf", "scale=" + w + ":" + h, "-q:v", "3", "-y", out]);
+    const data = await ff.readFile(out);
+    try { await ff.deleteFile(out); } catch (e) {}
+    return createImageBitmap(new Blob([data], { type: "image/jpeg" }));
+  });
+}
+
+// A run of frames from a clip, as JPEG blobs.
+function grabRange(c, t, dur, fps, w, h){
+  return ffRun(async () => {
+    const path = await clipPath(c);
+    const dir = "/run" + c.id;
+    try { await ff.createDir(dir); } catch (e) {}
+    for (const e of await ff.listDir(dir)) if (!e.isDir) { try { await ff.deleteFile(dir + "/" + e.name); } catch (x) {} }
+    await ff.exec(["-ss", Math.max(0, t).toFixed(3), "-i", path, "-t", dur.toFixed(3), "-vf", "fps=" + fps + ",scale=" + w + ":" + h, "-q:v", "3", "-y", dir + "/f%05d.jpg"]);
+    const names = (await ff.listDir(dir)).filter(e => !e.isDir).map(e => e.name).sort();
+    const out = [];
+    for (const n of names){
+      const d = await ff.readFile(dir + "/" + n);
+      out.push(new Blob([d], { type: "image/jpeg" }));
+      try { await ff.deleteFile(dir + "/" + n); } catch (e) {}
+    }
+    return out;
+  });
+}
 
 function setStatus(t){ $("status").textContent = t; }
 function setBar(f){ $("barFill").style.width = (Math.max(0, Math.min(1, f)) * 100).toFixed(1) + "%"; }
@@ -501,8 +566,7 @@ $("buildBtn").addEventListener("click", async () => {
     const conf = parseFloat($("conf").value) || 0.35;
     const layerBase = $("layerBase").checked;
     const base = clips[baseIdx];
-    let H = Math.round(W * base.video.videoHeight / base.video.videoWidth);
-    H -= H % 2;
+    const H = evenSize(W, base);
     let dur = parseFloat($("dur").value) || 6;
     for (const c of clips) dur = Math.min(dur, (c.video.duration || 0) - c.offset - 0.1);
     const n = Math.floor(dur * fps);
@@ -510,28 +574,34 @@ $("buildBtn").addEventListener("click", async () => {
     work.width = W; work.height = H;
     outW = W; outH = H; outFps = fps;
     const counts = clips.map(() => 0);
-    const steps = n * clips.length;
-    let step = 0;
     const t0 = performance.now();
-    for (let i = 0; i < n; i++){
-      const t = i / fps;
-      const frame = { blob: null, cuts: [] };
-      const order = [baseIdx, ...clips.map((_, k) => k).filter(k => k !== baseIdx)];
-      for (const k of order){
-        const c = clips[k];
-        await seekTo(c.video, c.offset + t);
-        await drawVideo(c.video, workCtx, W, H);
-        if (k === baseIdx) frame.blob = await canvasToBlob(work);
+    await loadDecoder();
+    const runs = [];
+    for (let k = 0; k < clips.length; k++){
+      setStatus("Pulling frames from clip " + (k + 1) + " of " + clips.length + "...");
+      setBar(0.15 * k / clips.length);
+      runs[k] = await grabRange(clips[k], clips[k].offset, n / fps, fps, W, H);
+    }
+    const m = Math.min(n, ...runs.map(r => r.length));
+    if (m < 2){ setStatus("The decoder returned no frames from these clips."); return; }
+    const steps = m * clips.length;
+    let step = 0;
+    const tDetect = performance.now();
+    for (let i = 0; i < m; i++){
+      const frame = { blob: runs[baseIdx][i], cuts: [] };
+      for (let k = 0; k < clips.length; k++){
         if (k !== baseIdx || layerBase){
+          const bmp = await createImageBitmap(runs[k][i]);
+          workCtx.drawImage(bmp, 0, 0, W, H); bmp.close();
           const cuts = await detectCars(W, H, conf);
           for (const cut of cuts){ cut.clip = k; frame.cuts.push(cut); }
           counts[k] += cuts.length;
         }
         step++;
-        setBar(step / steps);
-        const per = (performance.now() - t0) / step;
+        setBar(0.15 + 0.85 * step / steps);
+        const per = (performance.now() - tDetect) / step;
         const left = Math.round(per * (steps - step) / 1000);
-        setStatus("Frame " + (i + 1) + " of " + n + ", clip " + (k + 1) + ". About " + left + "s left.");
+        setStatus("Masking frame " + (i + 1) + " of " + m + ", clip " + (k + 1) + ". About " + left + "s left.");
       }
       frame.cuts.sort((a, b) => a.bottom - b.bottom); // farther cars first, closer cars drawn on top
       frames.push(frame);
