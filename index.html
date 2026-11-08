@@ -80,7 +80,7 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <main>
 <h1>Road Layers</h1>
 <p class="sub">Record drives with timing, then stack their cars onto one road.</p>
-<div class="tabs"><button id="tabRec">Record</button><button id="tabComp" class="on">Composite</button><button id="tabMap">Map</button></div>
+<div class="tabs"><button id="tabRec">Record</button><button id="tabComp" class="on">Composite</button><button id="tabMap">Map</button><button id="tabRoad">Road</button></div>
 
 <div id="mapView" hidden>
 <section class="card">
@@ -183,6 +183,30 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 </div>
 <div id="saveWrap"></div>
 <div class="status" id="outStatus"></div>
+</section>
+</div>
+
+<div id="roadView" hidden>
+<section class="card">
+<h2>Road tracking</h2>
+<p class="hint" style="margin-top:0">Finds the lane lines, vanishing point and lane width in every frame of a recording. Cars placed later ride along this track. Runs after the drive, not while recording.</p>
+<div class="inrow"><select id="roadPick"></select></div>
+<input id="roadFile" type="file" accept="video/*" style="margin-top:10px">
+<div class="grid" style="margin-top:10px">
+<label>Frames per second to track<select id="roadFps"><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+<label>Lane width<select id="laneFt"><option value="12" selected>12 feet (highway)</option><option value="11">11 feet</option><option value="10">10 feet (city)</option></select></label>
+</div>
+<div class="btns"><button id="roadGo">Track road</button></div>
+<div class="bar"><i id="roadBar"></i></div>
+<div class="status" id="roadStatus"></div>
+<canvas id="roadCanvas" style="margin-top:10px"></canvas>
+<div class="row"><input id="roadScrub" type="range" min="0" max="0" value="0"><span class="num" id="roadNum">0</span></div>
+<div class="stats">
+<div class="stat"><b id="rsConf">0</b><span>confidence</span></div>
+<div class="stat"><b id="rsLane">0</b><span>lane width px</span></div>
+<div class="stat"><b id="rsBend">0</b><span>bend</span></div>
+</div>
+<div class="legend" style="flex-wrap:wrap"><span style="color:#2e7d32">left line</span><span style="color:#1f6f8b">right line</span><span style="color:#d2601a">lane center</span><span style="color:#8a3fa0">vanishing point and horizon</span></div>
 </section>
 </div>
 </main>
@@ -860,18 +884,20 @@ function finishRecording(){
 <script>
 // ---------------- Record tab ----------------
 function showTab(name){
-  for (const [t, v] of [["tabRec", "recView"], ["tabComp", "compView"], ["tabMap", "mapView"]]){
+  for (const [t, v] of [["tabRec", "recView"], ["tabComp", "compView"], ["tabMap", "mapView"], ["tabRoad", "roadView"]]){
     $(v).hidden = t !== name;
     $(t).classList.toggle("on", t === name);
   }
   // the Library card sits outside the views; hide it on the map tab
   const lib = $("libList").closest("section");
-  if (lib) lib.hidden = name === "tabMap";
+  if (lib) lib.hidden = name === "tabMap" || name === "tabRoad";
   if (name === "tabMap") openMap();
+  if (name === "tabRoad") openRoad();
 }
 $("tabRec").addEventListener("click", () => showTab("tabRec"));
 $("tabComp").addEventListener("click", () => showTab("tabComp"));
 $("tabMap").addEventListener("click", () => showTab("tabMap"));
+$("tabRoad").addEventListener("click", () => showTab("tabRoad"));
 
 // Storage layout inside the app (origin private file system):
 //   drives/<drive>/part01/c000001.bin ...   chunks while recording
@@ -1302,6 +1328,7 @@ async function refreshLibrary(){
       else {
         await p.dir.removeEntry(p.name);
         if (p.tname) { try { await p.dir.removeEntry(p.tname); } catch (e) {} }
+        try { await p.dir.removeEntry(p.name.replace(/\.(webm|mp4)$/, "_road.json")); } catch (e) {}
       }
       refreshLibrary();
     });
@@ -1494,6 +1521,239 @@ async function renderProjects(){
     box.appendChild(d);
   }
 }
+
+
+// ---------------- Road tracking ----------------
+// Classic lane finding: edges plus white and yellow paint, a vote for the strongest left and right
+// lines, then a curve fit along each so bends are followed. Coordinates are saved as fractions of the frame.
+let roadItems = [], roadTrack = null, roadFrames = [], roadSrc = null;
+const RW = 480;
+const roadWork = document.createElement("canvas");
+const roadCtx = roadWork.getContext("2d", { willReadFrequently: true });
+
+async function openRoad(){
+  roadItems = (await scanLibrary()).filter(p => p.kind === "video");
+  const sel = $("roadPick");
+  sel.innerHTML = "";
+  const o0 = document.createElement("option"); o0.value = ""; o0.textContent = roadItems.length ? "Pick a recording from the Library" : "No recordings in the Library yet"; sel.appendChild(o0);
+  roadItems.forEach((p, i) => { const o = document.createElement("option"); o.value = String(i); o.textContent = itemLabel(p); sel.appendChild(o); });
+}
+$("roadPick").addEventListener("change", () => { if ($("roadPick").value !== "") $("roadFile").value = ""; });
+$("roadFile").addEventListener("change", () => { if ($("roadFile").files.length) $("roadPick").value = ""; });
+
+function videoMeta(file){
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+    v.muted = true; v.preload = "metadata";
+    v.src = URL.createObjectURL(file);
+    v.onloadedmetadata = async () => {
+      if (!isFinite(v.duration)){
+        await new Promise(r => { v.ondurationchange = () => { if (isFinite(v.duration)) r(); }; v.currentTime = 1e9; setTimeout(r, 5000); });
+      }
+      resolve({ w: v.videoWidth, h: v.videoHeight, dur: v.duration });
+      URL.revokeObjectURL(v.src);
+    };
+    v.onerror = () => reject(new Error("Could not open the video."));
+  });
+}
+
+// least squares fit of x = a*y^2 + b*y + c
+function fitQuad(pts){
+  let n = 0, sy = 0, sy2 = 0, sy3 = 0, sy4 = 0, sx = 0, sxy = 0, sxy2 = 0;
+  for (const [x, y, w] of pts){
+    n += w; sy += w * y; sy2 += w * y * y; sy3 += w * y * y * y; sy4 += w * y * y * y * y;
+    sx += w * x; sxy += w * x * y; sxy2 += w * x * y * y;
+  }
+  const M = [[sy4, sy3, sy2], [sy3, sy2, sy], [sy2, sy, n]], V = [sxy2, sxy, sx];
+  const det = m => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const D = det(M);
+  if (Math.abs(D) < 1e-9) return null;
+  const col = (k) => M.map((r, i) => r.map((v, j) => j === k ? V[i] : v));
+  return [det(col(0)) / D, det(col(1)) / D, det(col(2)) / D];
+}
+
+function trackFrame(img, W, H, prev){
+  const d = img.data;
+  const top = Math.round(H * (prev ? Math.max(0.3, prev.vp[1] / H) : 0.42)), bot = Math.round(H * 0.94);
+  // edge and paint score per pixel in the road zone
+  const gray = new Float32Array(W * H);
+  for (let i = 0, p = 0; i < W * H; i++, p += 4) gray[i] = 0.3 * d[p] + 0.59 * d[p + 1] + 0.11 * d[p + 2];
+  const pts = [];
+  for (let y = top + 1; y < bot - 1; y++){
+    for (let x = 1; x < W - 1; x++){
+      const i = y * W + x, p = i * 4;
+      const gx = gray[i + 1] - gray[i - 1];
+      const r = d[p], g = d[p + 1], b = d[p + 2];
+      const white = Math.min(r, g, b) > 170 && Math.max(r, g, b) - Math.min(r, g, b) < 40;
+      const yellow = r > 140 && g > 110 && b < 0.7 * g && r - b > 60;
+      if (Math.abs(gx) > 38 || white || yellow) pts.push([x, y, (white || yellow) ? 2 : 1]);
+    }
+  }
+  // vote: line x = xb + m*(bot - y), xb is where it meets the bottom of the zone
+  const span = bot - top;
+  const best = { L: null, R: null };
+  for (const side of ["L", "R"]){
+    const mLo = side === "L" ? 0.25 : -3.2, mHi = side === "L" ? 3.2 : -0.25;
+    const MB = 48, XB = Math.ceil(W * 3 / 4);
+    const acc = new Float32Array(MB * XB);
+    const nearTop = bot - span * 0.5;      // vote only with the near half, where lines are close to straight
+    for (const [x, y, w] of pts){
+      if (y < nearTop) continue;
+      const t = bot - y;
+      for (let mi = 0; mi < MB; mi++){
+        const m = mLo + (mHi - mLo) * mi / (MB - 1);
+        const xb = x - m * t;               // bottom crossing
+        const bi = Math.round((xb + W) / 4);
+        if (bi >= 0 && bi < XB) acc[mi * XB + bi] += w;
+      }
+    }
+    let bv = 0, bm = 0, bb = 0;
+    for (let mi = 0; mi < MB; mi++) for (let bi = 0; bi < XB; bi++){
+      let v = acc[mi * XB + bi];
+      const m = mLo + (mHi - mLo) * mi / (MB - 1), xb = bi * 4 - W;
+      // left line should sit left of center at the bottom, right line right of center
+      if (side === "L" ? xb > W * 0.55 : xb < W * 0.45) continue;
+      if (prev && prev[side]){ const dx = Math.abs(xb - prev[side].xb), dm = Math.abs(m - prev[side].m); v *= 1 / (1 + dx / 60 + dm / 0.8); }
+      if (v > bv){ bv = v; bm = m; bb = xb; }
+    }
+    if (bv > span * 0.3) best[side] = { m: bm, xb: bb, votes: bv };
+  }
+  if (!best.L || !best.R){
+    return prev ? Object.assign({}, prev, { conf: prev.conf * 0.6, held: true }) : null;
+  }
+  // trace each line upward step by step so it follows bends, then fit a curve to the traced points
+  const rows = new Map();
+  for (const pt of pts){ const k = pt[1] >> 2; if (!rows.has(k)) rows.set(k, []); rows.get(k).push(pt); }
+  const curve = {};
+  for (const side of ["L", "R"]){
+    const ln = best[side];
+    const traced = [];
+    let x = ln.xb, slope = ln.m, misses = 0;   // slope: pixels of x per pixel going up
+    for (let y = bot - 2; y > top; y -= 4){
+      x += slope * 4;
+      if (x < -W * 0.5 || x > W * 1.5) break;
+      const ww = 4 + 10 * (y - top) / span;
+      const cand = (rows.get(y >> 2) || []).filter(([px]) => Math.abs(px - x) <= ww);
+      if (cand.length){
+        let sw = 0, sx = 0;
+        for (const [px, , w] of cand){ sw += w; sx += w * px; }
+        const nx = sx / sw;
+        traced.push([nx, y, 1]);
+        x = nx; misses = 0;
+        if (traced.length >= 4){
+          const a = traced[traced.length - 4], b2 = traced[traced.length - 1];
+          const ns = (b2[0] - a[0]) / Math.max(1, a[1] - b2[1]);
+          slope = slope * 0.5 + ns * 0.5;
+        }
+      } else if (++misses > 12) break;
+    }
+    const q = traced.length >= 10 ? fitQuad(traced) : null;
+    curve[side] = q || [0, -ln.m, ln.xb + ln.m * bot];
+  }
+  // vanishing point from the straight parts
+  const yv = bot - (best.R.xb - best.L.xb) / (best.L.m - best.R.m);
+  const xv = best.L.xb + best.L.m * (bot - yv);
+  const at = (c, y) => c[0] * y * y + c[1] * y + c[2];
+  const lane = at(curve.R, bot) - at(curve.L, bot);
+  const conf = Math.min(1, (best.L.votes + best.R.votes) / (span * 6));
+  // bend: how far the lane center at the far end drifts from the straight line to the vanishing point
+  const yf = top + span * 0.1;
+  const cFar = (at(curve.L, yf) + at(curve.R, yf)) / 2;
+  const sFar = (best.L.xb + best.L.m * (bot - yf) + best.R.xb + best.R.m * (bot - yf)) / 2;
+  const out = { L: { m: best.L.m, xb: best.L.xb }, R: { m: best.R.m, xb: best.R.xb }, curveL: curve.L, curveR: curve.R, vp: [xv, yv], lane, bend: (cFar - sFar) / W * 10, top, bot, conf };
+  if (prev && !prev.held){
+    // light smoothing so the overlay doesn't jitter
+    const k = 0.35;
+    out.vp = [prev.vp[0] * k + out.vp[0] * (1 - k), prev.vp[1] * k + out.vp[1] * (1 - k)];
+    out.curveL = out.curveL.map((v, i) => prev.curveL[i] * k + v * (1 - k));
+    out.curveR = out.curveR.map((v, i) => prev.curveR[i] * k + v * (1 - k));
+    out.lane = prev.lane * k + out.lane * (1 - k);
+  }
+  return out;
+}
+
+function drawRoad(i){
+  const f = roadFrames[i], tr = roadTrack && roadTrack.frames[i];
+  if (!f) return;
+  const cv = $("roadCanvas");
+  cv.width = roadTrack.W; cv.height = roadTrack.H;
+  const ctx = cv.getContext("2d");
+  createImageBitmap(f).then(bmp => {
+    ctx.drawImage(bmp, 0, 0); bmp.close();
+    $("roadNum").textContent = (i + 1) + "/" + roadFrames.length;
+    if (!tr){ $("rsConf").textContent = "0"; return; }
+    const at = (c, y) => c[0] * y * y + c[1] * y + c[2];
+    const line = (fn, color, w) => { ctx.strokeStyle = color; ctx.lineWidth = w; ctx.beginPath(); for (let y = tr.top; y <= tr.bot; y += 3){ const x = fn(y); y === tr.top ? ctx.moveTo(x, y) : ctx.lineTo(x, y); } ctx.stroke(); };
+    ctx.globalAlpha = 0.18; ctx.fillStyle = "#d2601a";
+    ctx.beginPath();
+    for (let y = tr.top; y <= tr.bot; y += 3) ctx.lineTo(at(tr.curveL, y), y);
+    for (let y = tr.bot; y >= tr.top; y -= 3) ctx.lineTo(at(tr.curveR, y), y);
+    ctx.fill(); ctx.globalAlpha = 1;
+    line(y => at(tr.curveL, y), "#2e7d32", 4);
+    line(y => at(tr.curveR, y), "#1f6f8b", 4);
+    line(y => (at(tr.curveL, y) + at(tr.curveR, y)) / 2, "#d2601a", 2);
+    ctx.strokeStyle = "#8a3fa0"; ctx.lineWidth = 1.5; ctx.setLineDash([6, 6]);
+    ctx.beginPath(); ctx.moveTo(0, tr.vp[1]); ctx.lineTo(roadTrack.W, tr.vp[1]); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = "#8a3fa0"; ctx.beginPath(); ctx.arc(tr.vp[0], tr.vp[1], 6, 0, 7); ctx.fill();
+    $("rsConf").textContent = Math.round(tr.conf * 100) + "%" + (tr.held ? " held" : "");
+    $("rsLane").textContent = Math.round(tr.lane);
+    $("rsBend").textContent = Math.abs(tr.bend) < 0.3 ? "straight" : (tr.bend < 0 ? "left " : "right ") + Math.abs(tr.bend).toFixed(1);
+  });
+}
+$("roadScrub").addEventListener("input", e => drawRoad(parseInt(e.target.value)));
+
+$("roadGo").addEventListener("click", async () => {
+  const idx = $("roadPick").value;
+  let file = null, item = null;
+  if (idx !== ""){ item = roadItems[parseInt(idx)]; file = await item.handle.getFile(); }
+  else if ($("roadFile").files.length) file = $("roadFile").files[0];
+  if (!file){ $("roadStatus").textContent = "Pick a recording or a video file first."; return; }
+  const btn = $("roadGo"); btn.disabled = true;
+  try {
+    const meta = await videoMeta(file);
+    const fps = parseInt($("roadFps").value) || 4;
+    const H = Math.round(RW * meta.h / meta.w / 2) * 2;
+    const clip = { id: nextClipId++, file, mounted: null, video: { videoWidth: meta.w, videoHeight: meta.h } };
+    $("roadStatus").textContent = "Pulling frames...";
+    $("roadBar").style.width = "5%";
+    // pull in chunks of 20 seconds so memory stays low on long recordings
+    roadFrames = [];
+    for (let t = 0; t < meta.dur; t += 20){
+      const chunk = await grabRange(clip, t, Math.min(20, meta.dur - t), fps, RW, H);
+      roadFrames.push(...chunk);
+      $("roadBar").style.width = (5 + 45 * Math.min(1, (t + 20) / meta.dur)) + "%";
+      $("roadStatus").textContent = "Pulling frames... " + roadFrames.length;
+    }
+    roadWork.width = RW; roadWork.height = H;
+    roadTrack = { W: RW, H, fps, laneFeet: parseInt($("laneFt").value) || 12, source: item ? item.id : file.name, frames: [] };
+    let prev = null, good = 0;
+    for (let i = 0; i < roadFrames.length; i++){
+      const bmp = await createImageBitmap(roadFrames[i]);
+      roadCtx.drawImage(bmp, 0, 0); bmp.close();
+      const tr = trackFrame(roadCtx.getImageData(0, 0, RW, H), RW, H, prev);
+      roadTrack.frames.push(tr);
+      if (tr) prev = tr;
+      if (tr && !tr.held) good++;
+      if (i % 4 === 0){ $("roadBar").style.width = (50 + 50 * i / roadFrames.length) + "%"; $("roadStatus").textContent = "Tracking frame " + (i + 1) + " of " + roadFrames.length; await sleep(0); }
+    }
+    $("roadBar").style.width = "100%";
+    $("roadScrub").max = roadFrames.length - 1; $("roadScrub").value = 0;
+    drawRoad(0);
+    let msg = "Road found in " + good + " of " + roadFrames.length + " frames.";
+    if (item){
+      // save as fractions of the frame so it works at any size
+      const norm = { version: 1, fps, laneFeet: roadTrack.laneFeet, aspect: H / RW, frames: roadTrack.frames.map((f, i) => f ? {
+        t: +(i / fps).toFixed(3), conf: +f.conf.toFixed(3), held: !!f.held,
+        vp: [f.vp[0] / RW, f.vp[1] / RW], top: f.top / RW, bot: f.bot / RW, lane: f.lane / RW, bend: +f.bend.toFixed(3),
+        left: [f.curveL[0] * RW, f.curveL[1], f.curveL[2] / RW], right: [f.curveR[0] * RW, f.curveR[1], f.curveR[2] / RW]
+      } : null) };
+      await writeFile(item.dir, item.name.replace(/\.(webm|mp4)$/, "_road.json"), JSON.stringify(norm));
+      msg += " Saved with the recording.";
+    }
+    $("roadStatus").textContent = msg;
+  } catch (e){ $("roadStatus").textContent = "Road tracking stopped: " + (e && e.message ? e.message : e); }
+  btn.disabled = false;
+});
 
 (async () => { await setupBattery(); await recoverParts(); await refreshLibrary(); })();
 </script>
