@@ -1591,7 +1591,7 @@ function trackFrame(img, W, H, prev){
   }
   // vote: line x = xb + m*(bot - y), xb is where it meets the bottom of the zone
   const span = bot - top;
-  const best = { L: null, R: null };
+  const best = { L: null, R: null }, lines = { L: [], R: [] };
   for (const side of ["L", "R"]){
     const mLo = side === "L" ? 0.25 : -3.2, mHi = side === "L" ? 3.2 : -0.25;
     const MB = 48, XB = Math.ceil(W * 3 / 4);
@@ -1607,16 +1607,46 @@ function trackFrame(img, W, H, prev){
         if (bi >= 0 && bi < XB) acc[mi * XB + bi] += w;
       }
     }
-    let bv = 0, bm = 0, bb = 0;
+    // collect every line peak, then pick the one nearest the middle: that is your own lane's line
+    const score = new Float32Array(MB * XB);
     for (let mi = 0; mi < MB; mi++) for (let bi = 0; bi < XB; bi++){
       let v = acc[mi * XB + bi];
       const m = mLo + (mHi - mLo) * mi / (MB - 1), xb = bi * 4 - W;
       // left line should sit left of center at the bottom, right line right of center
       if (side === "L" ? xb > W * 0.55 : xb < W * 0.45) continue;
-      if (prev && prev[side]){ const dx = Math.abs(xb - prev[side].xb), dm = Math.abs(m - prev[side].m); v *= 1 / (1 + dx / 60 + dm / 0.8); }
-      if (v > bv){ bv = v; bm = m; bb = xb; }
+      if (prev && prev[side]){ const dx = Math.abs(xb - prev[side].xb), dm = Math.abs(m - prev[side].m); v *= 1 / (1 + dx / 120 + dm / 1.5); }
+      score[mi * XB + bi] = v;
     }
-    if (bv > span * 0.3) best[side] = { m: bm, xb: bb, votes: bv };
+    const peaks = [];
+    let top1 = 0;
+    for (let mi = 0; mi < MB; mi++) for (let bi = 0; bi < XB; bi++){
+      const v = score[mi * XB + bi];
+      if (v <= span * 0.12) continue;
+      let isMax = true;
+      for (let a = -3; a <= 3 && isMax; a++) for (let c = -8; c <= 8; c++){
+        const ma = mi + a, bc = bi + c;
+        if ((a || c) && ma >= 0 && ma < MB && bc >= 0 && bc < XB && score[ma * XB + bc] > v){ isMax = false; break; }
+      }
+      if (!isMax) continue;
+      const m = mLo + (mHi - mLo) * mi / (MB - 1), xb = bi * 4 - W;
+      // the same painted line seen twice: keep the stronger one
+      const dup = peaks.find(p => Math.abs(p.xb - xb) < 30);
+      if (dup){ if (v > dup.votes){ dup.votes = v; dup.m = m; dup.xb = xb; } continue; }
+      peaks.push({ m, xb, votes: v });
+      top1 = Math.max(top1, v);
+    }
+    const strong = peaks.filter(p => p.votes >= top1 * 0.15);
+    lines[side] = strong.map(p => ({ m: p.m, xb: p.xb }));
+    if (strong.length){
+      strong.sort((p, q) => side === "L" ? q.xb - p.xb : p.xb - q.xb);   // nearest the middle first
+      best[side] = strong[0];
+    }
+    // don't jump to a different painted line just because this frame lost the dashes: hold the last one a while
+    const old = prev && prev[side];
+    const outward = old && best[side] && (side === "L" ? best[side].xb < old.xb : best[side].xb > old.xb);
+    if (old && (prev.heldN || 0) < 10 && (!best[side] || (outward && Math.abs(best[side].xb - old.xb) > W * 0.2))){
+      best[side] = { m: old.m, xb: old.xb, votes: span * 0.2, held: true };
+    }
   }
   if (!best.L || !best.R){
     return prev ? Object.assign({}, prev, { conf: prev.conf * 0.6, held: true }) : null;
@@ -1645,7 +1675,7 @@ function trackFrame(img, W, H, prev){
           const ns = (b2[0] - a[0]) / Math.max(1, a[1] - b2[1]);
           slope = slope * 0.5 + ns * 0.5;
         }
-      } else if (++misses > 12) break;
+      } else if (++misses > 35) break;   // keeps going through the gaps in dashed lane lines
     }
     const q = traced.length >= 10 ? fitQuad(traced) : null;
     curve[side] = q || [0, -ln.m, ln.xb + ln.m * bot];
@@ -1655,12 +1685,13 @@ function trackFrame(img, W, H, prev){
   const xv = best.L.xb + best.L.m * (bot - yv);
   const at = (c, y) => c[0] * y * y + c[1] * y + c[2];
   const lane = at(curve.R, bot) - at(curve.L, bot);
-  const conf = Math.min(1, (best.L.votes + best.R.votes) / (span * 6));
+  const conf = Math.min(1, (best.L.votes + best.R.votes) / (span * 3));
   // bend: how far the lane center at the far end drifts from the straight line to the vanishing point
   const yf = top + span * 0.1;
   const cFar = (at(curve.L, yf) + at(curve.R, yf)) / 2;
   const sFar = (best.L.xb + best.L.m * (bot - yf) + best.R.xb + best.R.m * (bot - yf)) / 2;
-  const out = { L: { m: best.L.m, xb: best.L.xb }, R: { m: best.R.m, xb: best.R.xb }, curveL: curve.L, curveR: curve.R, vp: [xv, yv], lane, bend: (cFar - sFar) / W * 10, top, bot, conf };
+  const sideHeld = best.L.held || best.R.held;
+  const out = { heldN: sideHeld ? (prev && prev.heldN || 0) + 1 : 0, L: { m: best.L.m, xb: best.L.xb }, R: { m: best.R.m, xb: best.R.xb }, curveL: curve.L, curveR: curve.R, vp: [xv, yv], lane, bend: (cFar - sFar) / W * 10, top, bot, conf, lines };
   if (prev && !prev.held){
     // light smoothing so the overlay doesn't jitter
     const k = 0.35;
@@ -1689,6 +1720,7 @@ function drawRoad(i){
     for (let y = tr.top; y <= tr.bot; y += 3) ctx.lineTo(at(tr.curveL, y), y);
     for (let y = tr.bot; y >= tr.top; y -= 3) ctx.lineTo(at(tr.curveR, y), y);
     ctx.fill(); ctx.globalAlpha = 1;
+    if (tr.lines) for (const l of [...tr.lines.L, ...tr.lines.R]) line(y => l.xb + l.m * (tr.bot - y), "rgba(90,90,90,0.55)", 2);
     line(y => at(tr.curveL, y), "#2e7d32", 4);
     line(y => at(tr.curveR, y), "#1f6f8b", 4);
     line(y => (at(tr.curveL, y) + at(tr.curveR, y)) / 2, "#d2601a", 2);
@@ -1745,7 +1777,8 @@ $("roadGo").addEventListener("click", async () => {
       const norm = { version: 1, fps, laneFeet: roadTrack.laneFeet, aspect: H / RW, frames: roadTrack.frames.map((f, i) => f ? {
         t: +(i / fps).toFixed(3), conf: +f.conf.toFixed(3), held: !!f.held,
         vp: [f.vp[0] / RW, f.vp[1] / RW], top: f.top / RW, bot: f.bot / RW, lane: f.lane / RW, bend: +f.bend.toFixed(3),
-        left: [f.curveL[0] * RW, f.curveL[1], f.curveL[2] / RW], right: [f.curveR[0] * RW, f.curveR[1], f.curveR[2] / RW]
+        left: [f.curveL[0] * RW, f.curveL[1], f.curveL[2] / RW], right: [f.curveR[0] * RW, f.curveR[1], f.curveR[2] / RW],
+        others: f.lines ? [...f.lines.L, ...f.lines.R].map(l => [l.m, l.xb / RW]) : []
       } : null) };
       await writeFile(item.dir, item.name.replace(/\.(webm|mp4)$/, "_road.json"), JSON.stringify(norm));
       msg += " Saved with the recording.";
