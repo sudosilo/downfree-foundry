@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Road Layers</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 :root{
   --bg:#f6f4ef;--card:#ffffff;--ink:#1e2328;--muted:#5d6670;--line:#ddd8cc;
@@ -64,13 +65,44 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#b3261e;margin-right:6px;animation:blink 1s infinite}
 @keyframes blink{50%{opacity:.2}}
 #segList a{display:block}
+#map{height:62vh;border-radius:8px;border:1px solid var(--line);background:#e9e5dc}
+.legend{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);margin-top:8px}
+.legend i{display:inline-block;width:90px;height:8px;border-radius:4px;background:linear-gradient(90deg,rgba(210,96,26,.25),rgba(210,96,26,1))}
+.hitrow{display:flex;gap:8px;align-items:center;border:1px solid var(--line);border-radius:10px;padding:8px;margin-top:8px}
+.hitrow b{flex:1;font-size:14px;word-break:break-all}
+.proj{border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:10px}
+.proj .btns button{padding:6px 10px;font-size:14px}
+.inrow{display:flex;gap:8px;margin-top:10px}
+.inrow input,.inrow select{flex:1;font-size:15px;padding:8px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);min-width:0}
 </style>
 </head>
 <body>
 <main>
 <h1>Road Layers</h1>
 <p class="sub">Record drives with timing, then stack their cars onto one road.</p>
-<div class="tabs"><button id="tabRec">Record</button><button id="tabComp" class="on">Composite</button></div>
+<div class="tabs"><button id="tabRec">Record</button><button id="tabComp" class="on">Composite</button><button id="tabMap">Map</button></div>
+
+<div id="mapView" hidden>
+<section class="card">
+<h2>Where you've filmed</h2>
+<div id="map"></div>
+<div class="legend">Filmed once <i></i> many times</div>
+<p class="hint">Every recording is drawn along its route. Stretches filmed more often show darker. Tap the map to list the recordings that pass through that spot.</p>
+<div class="status" id="mapStatus"></div>
+<div id="hits"></div>
+<div id="hitActions" hidden>
+<div class="btns"><button id="hitUse">Use checked in Composite</button></div>
+<div class="inrow"><select id="hitProj"></select><button id="hitAdd" class="ghost">Add to project</button></div>
+</div>
+</section>
+
+<section class="card">
+<h2>Projects</h2>
+<p class="hint" style="margin-top:0">A project is a saved group of recordings for one stretch of road.</p>
+<div class="inrow"><input id="projName" placeholder="New project name" maxlength="60"><button id="projNew">Create</button></div>
+<div id="projList"></div>
+</section>
+</div>
 
 <div id="recView" hidden>
 <section class="card">
@@ -156,6 +188,7 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="ff/ffmpeg.js"></script>
 <script>
 if (window.ort){
@@ -826,8 +859,19 @@ function finishRecording(){
 </script>
 <script>
 // ---------------- Record tab ----------------
-$("tabRec").addEventListener("click", () => { $("recView").hidden = false; $("compView").hidden = true; $("tabRec").classList.add("on"); $("tabComp").classList.remove("on"); });
-$("tabComp").addEventListener("click", () => { $("recView").hidden = true; $("compView").hidden = false; $("tabComp").classList.add("on"); $("tabRec").classList.remove("on"); });
+function showTab(name){
+  for (const [t, v] of [["tabRec", "recView"], ["tabComp", "compView"], ["tabMap", "mapView"]]){
+    $(v).hidden = t !== name;
+    $(t).classList.toggle("on", t === name);
+  }
+  // the Library card sits outside the views; hide it on the map tab
+  const lib = $("libList").closest("section");
+  if (lib) lib.hidden = name === "tabMap";
+  if (name === "tabMap") openMap();
+}
+$("tabRec").addEventListener("click", () => showTab("tabRec"));
+$("tabComp").addEventListener("click", () => showTab("tabComp"));
+$("tabMap").addEventListener("click", () => showTab("tabMap"));
 
 // Storage layout inside the app (origin private file system):
 //   drives/<drive>/part01/c000001.bin ...   chunks while recording
@@ -1165,12 +1209,9 @@ async function stillsToVideo(item, fps){
   });
 }
 
-// ---------------- Library ----------------
-async function refreshLibrary(){
-  const list = $("libList");
-  if (!navigator.storage || !navigator.storage.getDirectory){ list.textContent = "This browser has no app storage."; return; }
-  let parts = [];
-  try {
+async function scanLibrary(){
+  const parts = [];
+  {
     const dd = await drivesDir();
     for (const [dn, dh] of await listEntries(dd)){
       if (dh.kind !== "directory") continue;
@@ -1180,16 +1221,18 @@ async function refreshLibrary(){
         if (h.kind !== "file" || !/^part\d+\.(webm|mp4)$/.test(n)) continue;
         const f = await h.getFile();
         const tname = n.replace(/\.(webm|mp4)$/, "_timing.json");
-        let gpsN = 0, speed = null;
+        let gpsN = 0, speed = null, track = [];
         if (names.includes(tname)){
           try {
             const t = JSON.parse(await (await (await dh.getFileHandle(tname)).getFile()).text());
             gpsN = t.gps.length;
+            track = t.gps.filter(g => g.lat != null && !g.carried).map(g => [g.lat, g.lon]);
+            if (!track.length) track = t.gps.filter(g => g.lat != null).map(g => [g.lat, g.lon]);
             const sp = t.gps.map(g => g.speed).filter(x => x != null);
             if (sp.length) speed = Math.round(sp.reduce((a, b) => a + b, 0) / sp.length * 2.23694);
           } catch (e) {}
         }
-        parts.push({ kind: "video", drive: dn, name: n, tname: names.includes(tname) ? tname : null, dir: dh, handle: h, size: f.size, gpsN, speed });
+        parts.push({ kind: "video", drive: dn, name: n, tname: names.includes(tname) ? tname : null, dir: dh, handle: h, size: f.size, gpsN, speed, track, id: dn + "/" + n });
       }
       const st = entries.find(([n, h]) => n === "stills" && h.kind === "directory");
       if (st){
@@ -1199,11 +1242,22 @@ async function refreshLibrary(){
           if (/^f\d+\.jpg$/.test(n)){ count++; size += (await h.getFile()).size; }
         }
         try { info = JSON.parse(await (await (await st[1].getFileHandle("stills.json")).getFile()).text()); } catch (e) {}
-        if (count) parts.push({ kind: "stills", drive: dn, name: "stills", dir: st[1], parentDir: dh, size, count, info });
+        const track = info && info.frames ? info.frames.filter(f => f.lat != null).map(f => [f.lat, f.lon]) : [];
+        if (count) parts.push({ kind: "stills", drive: dn, name: "stills", dir: st[1], parentDir: dh, size, count, info, track, id: dn + "/stills" });
       }
       if (!entries.length) { try { await dd.removeEntry(dn); } catch (e) {} }
     }
-  } catch (e){ list.textContent = "Could not read the library: " + e.message; return; }
+  }
+  return parts;
+}
+
+// ---------------- Library ----------------
+async function refreshLibrary(){
+  const list = $("libList");
+  if (!navigator.storage || !navigator.storage.getDirectory){ list.textContent = "This browser has no app storage."; return; }
+  let parts;
+  try { parts = await scanLibrary(); }
+  catch (e){ list.textContent = "Could not read the library: " + e.message; return; }
   parts.sort((a, b) => (b.drive + b.name).localeCompare(a.drive + a.name));
   list.innerHTML = "";
   if (!parts.length) list.innerHTML = '<p class="hint">No recordings yet.</p>';
@@ -1258,28 +1312,188 @@ async function refreshLibrary(){
 }
 
 $("libUse").addEventListener("click", async () => {
-  const picked = [...document.querySelectorAll("#libList input[type=checkbox]:checked")].map(x => x.libPart)
-    .sort((a, b) => (a.kind === "video" ? 0 : 1) - (b.kind === "video" ? 0 : 1)); // full video first so it becomes Base
+  const picked = [...document.querySelectorAll("#libList input[type=checkbox]:checked")].map(x => x.libPart);
   if (!picked.length){ $("libStorage").textContent = "Check one or more parts first."; return; }
+  await useInComposite(picked, $("libUse"), t => $("libStorage").textContent = t);
+});
+
+async function useInComposite(picked, btn, say){
+  picked = picked.slice().sort((a, b) => (a.kind === "video" ? 0 : 1) - (b.kind === "video" ? 0 : 1)); // full video first so it becomes Base
   const files = [];
-  const btn = $("libUse"); btn.disabled = true;
+  btn.disabled = true;
   try {
     for (const p of picked){
       if (p.kind === "stills"){
-        $("libStorage").textContent = "Building stop motion video for drive " + p.drive + "...";
+        say("Building stop motion video for drive " + p.drive + "...");
         files.push(await stillsToVideo(p, parseInt($("stillFps").value) || 8));
       } else {
         const f = await p.handle.getFile();
         files.push(new File([f], "drive_" + p.drive + "_" + p.name, { type: f.type }));
       }
     }
-  } catch (e){ $("libStorage").textContent = "Could not load: " + e.message; btn.disabled = false; return; }
+  } catch (e){ say("Could not load: " + e.message); btn.disabled = false; return; }
   btn.disabled = false;
+  say("");
   refreshLibrary();
-  $("tabComp").click();
+  showTab("tabComp");
   for (const x of document.querySelectorAll("#libList input[type=checkbox]")) x.checked = false;
   await addClipFiles(files);
+}
+
+
+// ---------------- Map and projects ----------------
+let map = null, mapItems = [], routeLayer = null, hitMarker = null, highlightLayer = null;
+const HIT_METERS = 80;
+
+async function loadProjects(){
+  try { return JSON.parse(await (await (await (await root()).getFileHandle("projects.json")).getFile()).text()); }
+  catch (e){ return []; }
+}
+async function saveProjects(list){ await writeFile(await root(), "projects.json", JSON.stringify(list)); }
+
+function itemLabel(p){
+  return (p.kind === "stills" ? "Stop motion, " : "Full video, ") + "drive " + p.drive.replace("_", " ") + (p.kind === "stills" ? "" : ", " + p.name.replace(/\.(webm|mp4)$/, "").replace("part", "part "));
+}
+
+async function openMap(){
+  if (!window.L){ $("mapStatus").textContent = "The map library did not load. Check the connection and reload."; return; }
+  if (!map){
+    map = L.map("map", { zoomControl: true }).setView([35.65, -114.85], 8); // Las Vegas to Laughlin
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "&copy; OpenStreetMap contributors" }).addTo(map);
+    routeLayer = L.layerGroup().addTo(map);
+    highlightLayer = L.layerGroup().addTo(map);
+    map.on("click", e => findHits(e.latlng.lat, e.latlng.lng));
+  }
+  setTimeout(() => map.invalidateSize(), 50);
+  await drawRoutes();
+  await renderProjects();
+}
+
+async function drawRoutes(){
+  mapItems = await scanLibrary();
+  routeLayer.clearLayers();
+  const withGps = mapItems.filter(p => p.track && p.track.length);
+  // each route is semi transparent, so places filmed more often stack up darker
+  for (const p of withGps){
+    if (p.track.length === 1) L.circleMarker(p.track[0], { radius: 5, color: "#d2601a", weight: 0, fillOpacity: 0.35 }).addTo(routeLayer);
+    else L.polyline(p.track, { color: "#d2601a", weight: 7, opacity: 0.3, lineCap: "round", lineJoin: "round" }).addTo(routeLayer);
+  }
+  $("mapStatus").textContent = withGps.length + " of " + mapItems.length + " recordings have GPS." + (mapItems.length > withGps.length ? " Ones without GPS can't be placed on the map." : "");
+  if (withGps.length && !map._fitOnce){
+    map._fitOnce = true;
+    map.fitBounds(L.latLngBounds(withGps.flatMap(p => p.track)), { padding: [20, 20], maxZoom: 15 });
+  }
+}
+
+function distToTrack(lat, lon, track){
+  let best = Infinity;
+  for (let i = 0; i < track.length; i++){
+    best = Math.min(best, haversine(lat, lon, track[i][0], track[i][1]));
+    if (i > 0){
+      // also check the midpoint so sparse GPS points still count
+      const m = [(track[i][0] + track[i - 1][0]) / 2, (track[i][1] + track[i - 1][1]) / 2];
+      best = Math.min(best, haversine(lat, lon, m[0], m[1]));
+    }
+  }
+  return best;
+}
+
+async function findHits(lat, lon){
+  if (hitMarker) hitMarker.remove();
+  hitMarker = L.circle([lat, lon], { radius: HIT_METERS, color: "#1f6f8b", weight: 2, fillOpacity: 0.1 }).addTo(map);
+  const hits = mapItems.filter(p => p.track && p.track.length && distToTrack(lat, lon, p.track) <= HIT_METERS);
+  showHitList(hits, hits.length + (hits.length === 1 ? " recording passes" : " recordings pass") + " through this spot.");
+}
+
+function showHitList(hits, msg){
+  const box = $("hits");
+  box.innerHTML = "";
+  $("mapStatus").textContent = msg;
+  highlightLayer.clearLayers();
+  for (const p of hits){
+    if (p.track.length > 1) L.polyline(p.track, { color: "#1f6f8b", weight: 4, opacity: 0.9 }).addTo(highlightLayer);
+    const r = document.createElement("label");
+    r.className = "hitrow";
+    r.innerHTML = '<input type="checkbox" checked><b></b>';
+    r.querySelector("b").textContent = itemLabel(p);
+    r.querySelector("input").libPart = p;
+    box.appendChild(r);
+  }
+  $("hitActions").hidden = !hits.length;
+  refreshProjectPicker();
+}
+
+function checkedHits(){ return [...document.querySelectorAll("#hits input:checked")].map(x => x.libPart); }
+
+$("hitUse").addEventListener("click", async () => {
+  const picked = checkedHits();
+  if (!picked.length){ $("mapStatus").textContent = "Check one or more recordings first."; return; }
+  await useInComposite(picked, $("hitUse"), t => $("mapStatus").textContent = t);
 });
+
+async function refreshProjectPicker(){
+  const projects = await loadProjects();
+  const sel = $("hitProj");
+  sel.innerHTML = "";
+  if (!projects.length){ const o = document.createElement("option"); o.value = ""; o.textContent = "Create a project below first"; sel.appendChild(o); return; }
+  for (const pr of projects){ const o = document.createElement("option"); o.value = pr.id; o.textContent = pr.name; sel.appendChild(o); }
+}
+
+$("hitAdd").addEventListener("click", async () => {
+  const id = $("hitProj").value;
+  const picked = checkedHits();
+  if (!id || !picked.length) return;
+  const projects = await loadProjects();
+  const pr = projects.find(x => x.id === id);
+  if (!pr) return;
+  let added = 0;
+  for (const p of picked) if (!pr.items.includes(p.id)){ pr.items.push(p.id); added++; }
+  await saveProjects(projects);
+  $("mapStatus").textContent = "Added " + added + " to " + pr.name + ".";
+  renderProjects();
+});
+
+$("projNew").addEventListener("click", async () => {
+  const name = $("projName").value.trim();
+  if (!name) return;
+  const projects = await loadProjects();
+  projects.push({ id: "p" + Date.now(), name, items: [], created: new Date().toISOString() });
+  await saveProjects(projects);
+  $("projName").value = "";
+  renderProjects(); refreshProjectPicker();
+});
+
+async function renderProjects(){
+  const projects = await loadProjects();
+  const box = $("projList");
+  box.innerHTML = "";
+  if (!projects.length){ box.innerHTML = '<p class="hint">No projects yet.</p>'; return; }
+  const byId = new Map(mapItems.map(p => [p.id, p]));
+  for (const pr of projects){
+    const items = pr.items.map(id => byId.get(id)).filter(Boolean);
+    const gone = pr.items.length - items.length;
+    const d = document.createElement("div");
+    d.className = "proj";
+    d.innerHTML = '<b></b><div class="lib-sub" style="margin-left:0"></div><div class="btns"><button class="ghost" data-a="show">Show on map</button><button class="ghost" data-a="use">Use in Composite</button><button class="ghost" data-a="del">Delete project</button></div>';
+    d.querySelector("b").textContent = pr.name;
+    d.querySelector(".lib-sub").textContent = items.length + " recordings" + (gone ? ", " + gone + " deleted from the library" : "");
+    d.querySelector('[data-a="show"]').addEventListener("click", () => {
+      showHitList(items, pr.name + ": " + items.length + " recordings.");
+      const pts = items.flatMap(p => p.track || []);
+      if (pts.length) map.fitBounds(L.latLngBounds(pts), { padding: [20, 20], maxZoom: 16 });
+      $("map").scrollIntoView({ behavior: "smooth" });
+    });
+    const useBtn = d.querySelector('[data-a="use"]');
+    useBtn.addEventListener("click", () => { if (items.length) useInComposite(items, useBtn, t => $("mapStatus").textContent = t); });
+    const del = d.querySelector('[data-a="del"]');
+    del.addEventListener("click", async () => {
+      if (del.dataset.armed !== "1"){ del.dataset.armed = "1"; del.textContent = "Tap again to delete"; setTimeout(() => { del.dataset.armed = ""; del.textContent = "Delete project"; }, 3000); return; }
+      await saveProjects((await loadProjects()).filter(x => x.id !== pr.id));
+      renderProjects(); refreshProjectPicker();
+    });
+    box.appendChild(d);
+  }
+}
 
 (async () => { await setupBattery(); await recoverParts(); await refreshLibrary(); })();
 </script>
