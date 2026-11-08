@@ -56,6 +56,9 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 .lib .btns{margin:8px 0 0 30px}
 .lib .btns button{padding:6px 10px;font-size:14px}
 .lib input[type=checkbox]{width:20px;height:20px}
+.tag{display:inline-block;font-size:12px;font-weight:700;padding:2px 8px;border-radius:20px;margin-right:6px;vertical-align:middle}
+.tag.v{background:#e3eef3;color:#1f6f8b}
+.tag.s{background:var(--soft);color:#a8480f}
 #recBig{width:100%;font-size:20px;padding:16px}
 #recBig.live{background:#b3261e;border-color:#b3261e}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#b3261e;margin-right:6px;animation:blink 1s infinite}
@@ -78,11 +81,14 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <div class="stat"><b id="stTime">0:00</b><span>recording</span></div>
 <div class="stat"><b id="stGps">none</b><span>GPS accuracy</span></div>
 <div class="stat"><b id="stPts">0</b><span>GPS points</span></div>
+<div class="stat"><b id="stStills">0</b><span>stop motion frames</span></div>
 <div class="stat"><b id="stSize">0</b><span>MB this part</span></div>
 <div class="stat"><b id="stBatt">?</b><span>battery</span></div>
 </div>
 <div class="grid" style="margin-top:10px">
 <label>Quality<select id="recRes"><option value="1280x720">720p</option><option value="1920x1080" selected>1080p</option></select></label>
+<label>Capture style<select id="capMode"><option value="video" selected>Full video</option><option value="stills">Stop motion</option><option value="both">Both at once</option></select></label>
+<label>Stop motion frame every<select id="stillEvery"><option value="d10">10 feet</option><option value="d25" selected>25 feet</option><option value="d50">50 feet</option><option value="d100">100 feet</option><option value="d250">250 feet</option><option value="t0.5">half second</option><option value="t1">1 second</option><option value="t2">2 seconds</option><option value="t5">5 seconds</option></select></label>
 <label>Split into parts every<select id="recSplit"><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="20">20 minutes</option></select></label>
 <label>Stop when battery reaches<select id="battStop"><option value="5" selected>5%</option><option value="10">10%</option><option value="15">15%</option></select></label>
 </div>
@@ -97,8 +103,9 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <h2>Library</h2>
 <div class="status" id="libStorage" style="margin-top:0"></div>
 <div id="libList"></div>
-<div class="btns"><button id="libUse">Use checked parts in Composite</button></div>
-<p class="hint">Save to phone copies a part out to Downloads. The app keeps its own copy either way.</p>
+<div class="grid" style="margin-top:10px"><label>Stop motion plays at<select id="stillFps"><option value="4">4 frames per second</option><option value="8" selected>8 frames per second</option><option value="12">12 frames per second</option><option value="24">24 frames per second</option></select></label></div>
+<div class="btns"><button id="libUse">Use checked items in Composite</button></div>
+<p class="hint">Full video parts and stop motion sets are marked. In Composite, pick a full video as Base so it supplies the road, and stop motion sets layer on top. Save to phone copies an item out to Downloads. The app keeps its own copy either way.</p>
 </section>
 
 <div id="compView">
@@ -872,7 +879,7 @@ async function recoverParts(){
     const dd = await drivesDir();
     for (const [dn, dh] of await listEntries(dd)){
       if (dh.kind !== "directory") continue;
-      for (const [pn, ph] of await listEntries(dh)) if (ph.kind === "directory") await assemblePart(dh, pn);
+      for (const [pn, ph] of await listEntries(dh)) if (ph.kind === "directory" && /^part\d+$/.test(pn)) await assemblePart(dh, pn);
     }
   } catch (e) {}
 }
@@ -927,7 +934,12 @@ function startGeo(){
   if (geoWatch !== null || !navigator.geolocation) return;
   geoWatch = navigator.geolocation.watchPosition(p => {
     const c = p.coords;
-    lastFix = c;
+    if (lastFix && c.speed == null && recording){
+      // no speed from the phone: estimate it from the move since the last fix
+      const dt = (p.timestamp - lastFixTime) / 1000;
+      if (dt > 0) estSpeed = haversine(lastFix.latitude, lastFix.longitude, c.latitude, c.longitude) / dt;
+    } else if (c.speed != null) estSpeed = c.speed;
+    lastFix = c; lastFixTime = p.timestamp;
     $("stSpeed").textContent = c.speed != null ? Math.round(c.speed * 2.23694) : "?";
     $("stGps").textContent = Math.round(c.accuracy) + " m";
     if (recording && segLog){
@@ -1009,11 +1021,15 @@ async function stopRecording(msg){
   recSay("Saving...");
   try { if (recorder2) await recorder2.finish(); }
   catch (e){ msg = "Save error: " + (e && e.message ? e.message : e); }
+  recorder2 = null;
+  try { await stopStills(); }
+  catch (e){ msg = "Save error: " + (e && e.message ? e.message : e); }
+  refreshLibrary();
   try { if (wakeLock) await wakeLock.release(); } catch (e) {}
   wakeLock = null;
   $("recBig").classList.remove("live");
   $("recBig").textContent = "Record";
-  $("camBtn").disabled = false; $("recRes").disabled = false;
+  $("camBtn").disabled = false; $("recRes").disabled = false; $("capMode").disabled = false; $("stillEvery").disabled = false;
   stopping = false;
   recSay(msg || "Stopped and saved in the Library below.");
 }
@@ -1021,26 +1037,133 @@ async function stopRecording(msg){
 $("recBig").addEventListener("click", async () => {
   if (!camStream || stopping) return;
   if (recording){ stopRecording(); return; }
-  if (!recMime){ recSay("This browser cannot record video."); return; }
+  const mode = captureMode();
+  if (mode !== "stills" && !recMime){ recSay("This browser cannot record video."); return; }
   if (!navigator.storage || !navigator.storage.getDirectory){ recSay("This browser has no app storage for recordings."); return; }
   if (battery && !battery.charging && battery.level * 100 <= (parseInt($("battStop").value) || 5)){ recSay("Battery is too low to start."); return; }
   try { if (navigator.storage.persist) await navigator.storage.persist(); } catch (e) {}
   recording = true;
   driveId = stamp(new Date()); segIndex = 0;
   await grabWakeLock();
-  try { await startSegment(); }
+  try {
+    const t0 = performance.now();
+    if (mode !== "stills") await startSegment();
+    if (mode !== "video") await startStills(mode === "both" ? segStartPerf || t0 : t0);
+  }
   catch (e){ recording = false; recSay("Could not start: " + (e && e.message ? e.message : e)); return; }
   $("recBig").classList.add("live");
   $("recBig").textContent = "Stop";
-  $("camBtn").disabled = true; $("recRes").disabled = true;
+  $("camBtn").disabled = true; $("recRes").disabled = true; $("capMode").disabled = true; $("stillEvery").disabled = true;
   const t0 = performance.now();
   tickTimer = setInterval(() => {
     const s = Math.floor((performance.now() - t0) / 1000);
     $("stTime").textContent = Math.floor(s / 60) + ":" + pad(s % 60);
     checkBattery();
+    if (s % 15 === 0) storageLeft().then(x => { if (x && x.quota && x.left < 300 * 1048576) stopRecording("App storage almost full. Recording stopped and saved."); });
   }, 1000);
-  $("recStatus").innerHTML = '<span class="dot"></span>Recording. Saving into the app every few seconds. Keep this screen open.';
+  $("recStatus").innerHTML = '<span class="dot"></span>' + (mode === "stills" ? "Capturing stop motion." : mode === "both" ? "Recording video and stop motion." : "Recording.") + " Saving into the app as it goes. Keep this screen open.";
 });
+
+
+// ---------------- Stop motion ----------------
+// Frames are grabbed from the live camera at fixed distances (using GPS speed between fixes) or fixed times.
+let lastFixTime = 0, estSpeed = null;
+let stillsDir = null, stillsLog = null, stillTimer = null, stillN = 0, stillDist = 0, stillLastTick = 0, stillLastAt = 0, stillBusy = false;
+let stillChain = Promise.resolve();
+const stillCanvas = document.createElement("canvas");
+const stillCtx = stillCanvas.getContext("2d");
+
+function haversine(a1, o1, a2, o2){
+  const R = 6371000, r = Math.PI / 180;
+  const da = (a2 - a1) * r, dob = (o2 - o1) * r;
+  const h = Math.sin(da / 2) ** 2 + Math.cos(a1 * r) * Math.cos(a2 * r) * Math.sin(dob / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function captureMode(){ return $("capMode").value; }
+
+async function startStills(t0){
+  const dd = await drivesDir();
+  const driveDir = await dd.getDirectoryHandle(driveId, { create: true });
+  stillsDir = await driveDir.getDirectoryHandle("stills", { create: true });
+  const every = $("stillEvery").value;
+  const byDist = every[0] === "d";
+  const step = parseFloat(every.slice(1)) * (byDist ? 0.3048 : 1); // meters or seconds
+  stillsLog = { drive: driveId, mode: byDist ? "distance" : "time", every: every, stepMeters: byDist ? step : null, stepSeconds: byDist ? null : step, startWall: new Date().toISOString(), frames: [] };
+  stillN = 0; stillDist = 0; stillLastTick = performance.now(); stillLastAt = performance.now() - 1e9;
+  $("stStills").textContent = "0";
+  const thisDir = stillsDir, thisLog = stillsLog;
+  clearInterval(stillTimer);
+  stillTimer = setInterval(() => {
+    const now = performance.now();
+    const dt = (now - stillLastTick) / 1000;
+    stillLastTick = now;
+    if (byDist){
+      stillDist += (estSpeed || 0) * dt;
+      if (stillDist >= step){ stillDist -= step; if (stillDist > step) stillDist = 0; grabStill(thisDir, thisLog, t0); }
+    } else if ((now - stillLastAt) / 1000 >= step){
+      stillLastAt = now; grabStill(thisDir, thisLog, t0);
+    }
+  }, 50);
+}
+
+function grabStill(dir, log, t0){
+  if (stillBusy) return;            // camera can't keep up: skip rather than pile up
+  const v = $("recPreview");
+  if (!v.videoWidth) return;
+  stillBusy = true;
+  stillCanvas.width = v.videoWidth; stillCanvas.height = v.videoHeight;
+  stillCtx.drawImage(v, 0, 0);
+  const n = ++stillN;
+  const entry = {
+    n, file: "f" + pad(n, 6) + ".jpg",
+    t: +((performance.now() - t0) / 1000).toFixed(3),
+    wall: Date.now(),
+    lat: lastFix ? lastFix.latitude : null, lon: lastFix ? lastFix.longitude : null,
+    speed: estSpeed, heading: lastFix ? lastFix.heading : null
+  };
+  stillCanvas.toBlob(blob => {
+    stillBusy = false;
+    if (!blob) return;
+    log.frames.push(entry);
+    $("stStills").textContent = log.frames.length;
+    stillChain = stillChain.then(async () => {
+      await writeFile(dir, entry.file, blob);
+      if (n % 10 === 0) await writeFile(dir, "stills.json", JSON.stringify(log));
+    }).catch(err => recSay("Save error: " + (err && err.message ? err.message : err)));
+  }, "image/jpeg", 0.9);
+}
+
+async function stopStills(){
+  clearInterval(stillTimer); stillTimer = null;
+  if (!stillsDir) return;
+  for (let k = 0; k < 20 && stillBusy; k++) await sleep(50);
+  await stillChain;
+  await writeFile(stillsDir, "stills.json", JSON.stringify(stillsLog));
+  stillsDir = null;
+}
+
+// Turns a stop motion set into a video so Composite can use it like any clip.
+async function stillsToVideo(item, fps){
+  const files = [];
+  for (const [n, h] of await listEntries(item.dir)) if (h.kind === "file" && /^f\d+\.jpg$/.test(n)) files.push(await h.getFile());
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  if (files.length < 2) throw new Error("Stop motion set has fewer than 2 frames.");
+  // renumber so the sequence has no gaps
+  const seq = files.map((f, i) => new File([f], "s" + pad(i + 1, 6) + ".jpg", { type: "image/jpeg" }));
+  return ffRun(async () => {
+    const dir = "/st" + Date.now();
+    await ff.createDir(dir);
+    await ff.mount("WORKERFS", { files: seq }, dir);
+    const out = "/stills_out.mp4";
+    await ff.exec(["-framerate", String(fps), "-i", dir + "/s%06d.jpg", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p", "-y", out]);
+    const data = await ff.readFile(out);
+    try { await ff.deleteFile(out); } catch (e) {}
+    try { await ff.unmount(dir); } catch (e) {}
+    if (!data || !data.length) throw new Error("Could not build video from stop motion frames.");
+    return new File([data], "drive_" + item.drive + "_stopmotion.mp4", { type: "video/mp4" });
+  });
+}
 
 // ---------------- Library ----------------
 async function refreshLibrary(){
@@ -1066,7 +1189,17 @@ async function refreshLibrary(){
             if (sp.length) speed = Math.round(sp.reduce((a, b) => a + b, 0) / sp.length * 2.23694);
           } catch (e) {}
         }
-        parts.push({ drive: dn, name: n, tname: names.includes(tname) ? tname : null, dir: dh, handle: h, size: f.size, gpsN, speed });
+        parts.push({ kind: "video", drive: dn, name: n, tname: names.includes(tname) ? tname : null, dir: dh, handle: h, size: f.size, gpsN, speed });
+      }
+      const st = entries.find(([n, h]) => n === "stills" && h.kind === "directory");
+      if (st){
+        let count = 0, size = 0, info = null;
+        for (const [n, h] of await listEntries(st[1])){
+          if (h.kind !== "file") continue;
+          if (/^f\d+\.jpg$/.test(n)){ count++; size += (await h.getFile()).size; }
+        }
+        try { info = JSON.parse(await (await (await st[1].getFileHandle("stills.json")).getFile()).text()); } catch (e) {}
+        if (count) parts.push({ kind: "stills", drive: dn, name: "stills", dir: st[1], parentDir: dh, size, count, info });
       }
       if (!entries.length) { try { await dd.removeEntry(dn); } catch (e) {} }
     }
@@ -1079,20 +1212,43 @@ async function refreshLibrary(){
     d.className = "lib";
     d.innerHTML = '<div class="lib-top"><input type="checkbox"><b></b></div><div class="lib-sub"></div>' +
       '<div class="btns"><button class="ghost" data-a="save">Save to phone</button><button class="ghost" data-a="del">Delete</button></div>';
-    d.querySelector("b").textContent = "Drive " + p.drive.replace("_", " ") + ", " + p.name.replace(/\.(webm|mp4)$/, "").replace("part", "part ");
-    d.querySelector(".lib-sub").textContent = mb(p.size) + (p.gpsN ? ", " + p.gpsN + " GPS points" : ", no GPS") + (p.speed != null ? ", avg " + p.speed + " mph" : "");
+    const tag = document.createElement("span");
+    tag.className = "tag " + (p.kind === "stills" ? "s" : "v");
+    tag.textContent = p.kind === "stills" ? "Stop motion" : "Full video";
+    const title = d.querySelector("b");
+    title.textContent = "Drive " + p.drive.replace("_", " ") + (p.kind === "stills" ? "" : ", " + p.name.replace(/\.(webm|mp4)$/, "").replace("part", "part "));
+    title.prepend(tag);
+    if (p.kind === "stills"){
+      const every = p.info && p.info.every ? (p.info.every[0] === "d" ? "every " + p.info.every.slice(1) + " ft" : "every " + p.info.every.slice(1) + " s") : "";
+      d.querySelector(".lib-sub").textContent = p.count + " frames" + (every ? ", " + every : "") + ", " + mb(p.size);
+      d.querySelector('[data-a="save"]').textContent = "Save as video to phone";
+    } else {
+      d.querySelector(".lib-sub").textContent = mb(p.size) + (p.gpsN ? ", " + p.gpsN + " GPS points" : ", no GPS") + (p.speed != null ? ", avg " + p.speed + " mph" : "");
+    }
     d.querySelector("input").libPart = p;
-    d.querySelector('[data-a="save"]').addEventListener("click", async () => {
-      const f = await p.handle.getFile();
+    d.querySelector('[data-a="save"]').addEventListener("click", async e => {
       const go = (blob, name) => { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); };
+      if (p.kind === "stills"){
+        const btn = e.target; btn.disabled = true; btn.textContent = "Building video...";
+        try {
+          go(await stillsToVideo(p, parseInt($("stillFps").value) || 8), "drive_" + p.drive + "_stopmotion.mp4");
+          try { go(await (await p.dir.getFileHandle("stills.json")).getFile(), "drive_" + p.drive + "_stopmotion_timing.json"); } catch (x) {}
+        } catch (x){ $("libStorage").textContent = x.message; }
+        btn.disabled = false; btn.textContent = "Save as video to phone";
+        return;
+      }
+      const f = await p.handle.getFile();
       go(f, "drive_" + p.drive + "_" + p.name);
       if (p.tname) go(await (await p.dir.getFileHandle(p.tname)).getFile(), "drive_" + p.drive + "_" + p.tname);
     });
     const del = d.querySelector('[data-a="del"]');
     del.addEventListener("click", async () => {
       if (del.dataset.armed !== "1"){ del.dataset.armed = "1"; del.textContent = "Tap again to delete"; setTimeout(() => { del.dataset.armed = ""; del.textContent = "Delete"; }, 3000); return; }
-      await p.dir.removeEntry(p.name);
-      if (p.tname) { try { await p.dir.removeEntry(p.tname); } catch (e) {} }
+      if (p.kind === "stills") await p.parentDir.removeEntry("stills", { recursive: true });
+      else {
+        await p.dir.removeEntry(p.name);
+        if (p.tname) { try { await p.dir.removeEntry(p.tname); } catch (e) {} }
+      }
       refreshLibrary();
     });
     list.appendChild(d);
@@ -1102,13 +1258,24 @@ async function refreshLibrary(){
 }
 
 $("libUse").addEventListener("click", async () => {
-  const picked = [...document.querySelectorAll("#libList input[type=checkbox]:checked")].map(x => x.libPart);
+  const picked = [...document.querySelectorAll("#libList input[type=checkbox]:checked")].map(x => x.libPart)
+    .sort((a, b) => (a.kind === "video" ? 0 : 1) - (b.kind === "video" ? 0 : 1)); // full video first so it becomes Base
   if (!picked.length){ $("libStorage").textContent = "Check one or more parts first."; return; }
   const files = [];
-  for (const p of picked){
-    const f = await p.handle.getFile();
-    files.push(new File([f], "drive_" + p.drive + "_" + p.name, { type: f.type }));
-  }
+  const btn = $("libUse"); btn.disabled = true;
+  try {
+    for (const p of picked){
+      if (p.kind === "stills"){
+        $("libStorage").textContent = "Building stop motion video for drive " + p.drive + "...";
+        files.push(await stillsToVideo(p, parseInt($("stillFps").value) || 8));
+      } else {
+        const f = await p.handle.getFile();
+        files.push(new File([f], "drive_" + p.drive + "_" + p.name, { type: f.type }));
+      }
+    }
+  } catch (e){ $("libStorage").textContent = "Could not load: " + e.message; btn.disabled = false; return; }
+  btn.disabled = false;
+  refreshLibrary();
   $("tabComp").click();
   for (const x of document.querySelectorAll("#libList input[type=checkbox]")) x.checked = false;
   await addClipFiles(files);
