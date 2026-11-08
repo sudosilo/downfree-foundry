@@ -49,6 +49,13 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 .stat{border:1px solid var(--line);border-radius:10px;padding:8px;text-align:center}
 .stat b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
 .stat span{font-size:12px;color:var(--muted)}
+.lib{border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:10px}
+.lib-top{display:flex;gap:8px;align-items:center}
+.lib-top b{flex:1;word-break:break-all}
+.lib-sub{font-size:13px;color:var(--muted);margin:4px 0 0 30px}
+.lib .btns{margin:8px 0 0 30px}
+.lib .btns button{padding:6px 10px;font-size:14px}
+.lib input[type=checkbox]{width:20px;height:20px}
 #recBig{width:100%;font-size:20px;padding:16px}
 #recBig.live{background:#b3261e;border-color:#b3261e}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#b3261e;margin-right:6px;animation:blink 1s infinite}
@@ -72,25 +79,33 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <div class="stat"><b id="stGps">none</b><span>GPS accuracy</span></div>
 <div class="stat"><b id="stPts">0</b><span>GPS points</span></div>
 <div class="stat"><b id="stSize">0</b><span>MB this part</span></div>
-<div class="stat"><b id="stSeg">0</b><span>parts saved</span></div>
+<div class="stat"><b id="stBatt">?</b><span>battery</span></div>
 </div>
 <div class="grid" style="margin-top:10px">
 <label>Quality<select id="recRes"><option value="1280x720">720p</option><option value="1920x1080" selected>1080p</option></select></label>
 <label>Split into parts every<select id="recSplit"><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="20">20 minutes</option></select></label>
+<label>Stop when battery reaches<select id="battStop"><option value="5" selected>5%</option><option value="10">10%</option><option value="15">15%</option></select></label>
 </div>
 <div class="btns"><button id="camBtn" class="ghost">Start camera</button></div>
 <div class="btns"><button id="recBig" disabled>Record</button></div>
 <div class="status" id="recStatus">Mount the phone sideways in the same spot every drive, then tap Start camera.</div>
-<p class="hint">Each part saves two files with matching names: the video, and a timing file with GPS, speed and heading tied to the video's clock. Keep both together.</p>
-<div id="segList"></div>
+<p class="hint">Recordings save inside the app every few seconds, so a crash or reload keeps everything up to that moment. Each part keeps its GPS, speed and heading tied to the video's clock.</p>
 </section>
 </div>
+
+<section class="card">
+<h2>Library</h2>
+<div class="status" id="libStorage" style="margin-top:0"></div>
+<div id="libList"></div>
+<div class="btns"><button id="libUse">Use checked parts in Composite</button></div>
+<p class="hint">Save to phone copies a part out to Downloads. The app keeps its own copy either way.</p>
+</section>
 
 <div id="compView">
 <section class="card">
 <h2>1. Clips</h2>
 <input id="files" type="file" accept="video/*" multiple>
-<p class="hint">Pick two or more clips of the same stretch of road. The clip marked Base supplies the road.</p>
+<p class="hint">Add parts from the Library above, or pick video files from the phone. The clip marked Base supplies the road.</p>
 <div id="clipList"></div>
 </section>
 
@@ -239,6 +254,11 @@ function loadClip(file){
 
 $("files").addEventListener("change", async e => {
   const list = [...e.target.files];
+  e.target.value = "";
+  await addClipFiles(list);
+});
+
+async function addClipFiles(list){
   if (!list.length) return;
   setStatus("Opening clips...");
   for (const f of list){
@@ -247,14 +267,13 @@ $("files").addEventListener("change", async e => {
       clips.push({ id: nextClipId++, file: f, mounted: null, name: f.name, video: v, offset: 0, enabled: true, thumb: null, range: null, num: null });
     } catch (err){ setStatus(err.message); }
   }
-  e.target.value = "";
   if (selectedIdx < 0 && clips.length > 1) selectedIdx = baseIdx === 0 ? 1 : 0;
   renderClips();
   for (const c of clips) await drawThumb(c);
   updateAlign();
   $("buildBtn").disabled = clips.length < 2;
   setStatus(clips.length < 2 ? "Add at least one more clip." : clips.length + " clips ready.");
-});
+}
 
 async function drawThumb(c){
   await seekTo(c.video, c.offset);
@@ -803,20 +822,89 @@ function finishRecording(){
 $("tabRec").addEventListener("click", () => { $("recView").hidden = false; $("compView").hidden = true; $("tabRec").classList.add("on"); $("tabComp").classList.remove("on"); });
 $("tabComp").addEventListener("click", () => { $("recView").hidden = true; $("compView").hidden = false; $("tabComp").classList.add("on"); $("tabRec").classList.remove("on"); });
 
-let camStream = null, recorder2 = null, recChunks2 = [], recBytes = 0;
-let geoWatch = null, wakeLock = null, recording = false;
-let driveId = "", segIndex = 0, segStartPerf = 0, segStartWall = 0, segTimer = null, tickTimer = null;
-let segLog = null, lastFix = null, segsSaved = 0;
+// Storage layout inside the app (origin private file system):
+//   drives/<drive>/part01/c000001.bin ...   chunks while recording
+//   drives/<drive>/part01.webm              finished video
+//   drives/<drive>/part01_timing.json       GPS log tied to the video clock
+const CHUNK_MS = 4000;
+let camStream = null, recorder2 = null, recording = false, stopping = false;
+let geoWatch = null, wakeLock = null, lastFix = null;
+let driveId = "", segIndex = 0, segStartPerf = 0, segTimer = null, tickTimer = null;
+let segLog = null, segDir = null, chunkNo = 0, recBytes = 0, writeChain = Promise.resolve();
+let battery = null;
 const recMime = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"].find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+const recExt = recMime.indexOf("mp4") >= 0 ? "mp4" : "webm";
 
 function recSay(t){ $("recStatus").textContent = t; }
-function pad(n){ return String(n).padStart(2, "0"); }
+function pad(n, w){ return String(n).padStart(w || 2, "0"); }
 function stamp(d){ return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + "_" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()); }
+function mb(n){ return (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + " MB"; }
 
-async function grabWakeLock(){
-  try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+async function root(){ return navigator.storage.getDirectory(); }
+async function drivesDir(){ return (await root()).getDirectoryHandle("drives", { create: true }); }
+async function writeFile(dir, name, data){
+  const fh = await dir.getFileHandle(name, { create: true });
+  const w = await fh.createWritable();
+  await w.write(data); await w.close();
 }
+async function listEntries(dir){ const out = []; for await (const [n, h] of dir.entries()) out.push([n, h]); return out; }
+
+// Joins a part's chunk files into one video file, then removes the chunks.
+async function assemblePart(driveDir, partName){
+  let chunkDir;
+  try { chunkDir = await driveDir.getDirectoryHandle(partName); } catch (e){ return; }
+  const names = (await listEntries(chunkDir)).filter(([n, h]) => h.kind === "file" && n.startsWith("c")).map(([n]) => n).sort();
+  if (names.length){
+    let ext = recExt;
+    try { const m = JSON.parse(await (await (await chunkDir.getFileHandle("meta.json")).getFile()).text()); if (m.mime && m.mime.indexOf("mp4") >= 0) ext = "mp4"; } catch (e) {}
+    const fh = await driveDir.getFileHandle(partName + "." + ext, { create: true });
+    const w = await fh.createWritable();
+    for (const n of names) await w.write(await (await chunkDir.getFileHandle(n)).getFile());
+    await w.close();
+    try { const t = await (await chunkDir.getFileHandle("timing.json")).getFile(); await writeFile(driveDir, partName + "_timing.json", t); } catch (e) {}
+  }
+  await driveDir.removeEntry(partName, { recursive: true });
+}
+
+// After a crash or reload, finish any part that was still recording.
+async function recoverParts(){
+  try {
+    const dd = await drivesDir();
+    for (const [dn, dh] of await listEntries(dd)){
+      if (dh.kind !== "directory") continue;
+      for (const [pn, ph] of await listEntries(dh)) if (ph.kind === "directory") await assemblePart(dh, pn);
+    }
+  } catch (e) {}
+}
+
+async function grabWakeLock(){ try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {} }
 document.addEventListener("visibilitychange", () => { if (recording && document.visibilityState === "visible") grabWakeLock(); });
+
+// ---- battery rule ----
+async function setupBattery(){
+  if (!navigator.getBattery){ $("stBatt").textContent = "n/a"; return; }
+  try {
+    battery = await navigator.getBattery();
+    const show = () => {
+      $("stBatt").textContent = Math.round(battery.level * 100) + "%" + (battery.charging ? "+" : "");
+      checkBattery();
+    };
+    battery.addEventListener("levelchange", show);
+    battery.addEventListener("chargingchange", show);
+    show();
+  } catch (e){ $("stBatt").textContent = "n/a"; }
+}
+function checkBattery(){
+  if (!battery || !recording || battery.charging) return;
+  const limit = parseInt($("battStop").value) || 5;
+  if (battery.level * 100 <= limit) stopRecording("Battery reached " + limit + "%. Recording stopped and saved.");
+}
+
+// ---- storage rule: stop before the phone runs out of room for the app ----
+async function storageLeft(){
+  try { const e = await navigator.storage.estimate(); return { used: e.usage || 0, quota: e.quota || 0, left: (e.quota || 0) - (e.usage || 0) }; }
+  catch (e){ return null; }
+}
 
 $("camBtn").addEventListener("click", async () => {
   if (camStream){ for (const t of camStream.getTracks()) t.stop(); camStream = null; }
@@ -845,7 +933,7 @@ function startGeo(){
     if (recording && segLog){
       segLog.gps.push({
         t: +((performance.now() - segStartPerf) / 1000).toFixed(3), // seconds into this video part
-        fixTime: p.timestamp,                                       // when the phone took the fix
+        fixTime: p.timestamp,
         lat: c.latitude, lon: c.longitude, alt: c.altitude,
         acc: c.accuracy, speed: c.speed, heading: c.heading
       });
@@ -854,83 +942,179 @@ function startGeo(){
     if (!recording) recSay("Camera and GPS ready. Tap Record.");
   }, e => {
     $("stGps").textContent = "off";
-    recSay("GPS problem: " + e.message + ". Video still records without location.");
+    if (!recording) recSay("GPS problem: " + e.message + ". Video still records without location.");
   }, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
 }
 
-function startSegment(){
-  recChunks2 = []; recBytes = 0;
-  const [w, h] = $("recRes").value.split("x").map(Number);
-  recorder2 = new MediaRecorder(camStream, { mimeType: recMime, videoBitsPerSecond: w >= 1920 ? 8000000 : 5000000 });
+async function startSegment(){
+  const dd = await drivesDir();
+  const driveDir = await dd.getDirectoryHandle(driveId, { create: true });
+  const partName = "part" + pad(segIndex + 1);
+  segDir = await driveDir.getDirectoryHandle(partName, { create: true });
+  chunkNo = 0; recBytes = 0;
+  const [w] = $("recRes").value.split("x").map(Number);
   const st = camStream.getVideoTracks()[0].getSettings();
-  segLog = {
-    drive: driveId, part: segIndex + 1, mime: recMime,
-    width: st.width, height: st.height, fps: st.frameRate,
-    startWall: null, gps: []
+  segLog = { drive: driveId, part: segIndex + 1, mime: recMime, width: st.width, height: st.height, fps: st.frameRate, startWall: null, gps: [] };
+  await writeFile(segDir, "meta.json", JSON.stringify({ mime: recMime }));
+  const thisDir = segDir, thisLog = segLog;
+  const rec = new MediaRecorder(camStream, { mimeType: recMime, videoBitsPerSecond: w >= 1920 ? 8000000 : 5000000 });
+  rec.ondataavailable = e => {
+    if (!e.data || !e.data.size) return;
+    const n = ++chunkNo;
+    recBytes += e.data.size;
+    $("stSize").textContent = (recBytes / 1048576).toFixed(0);
+    const data = e.data;
+    writeChain = writeChain.then(async () => {
+      await writeFile(thisDir, "c" + pad(n, 6) + ".bin", data);
+      await writeFile(thisDir, "timing.json", JSON.stringify(thisLog));
+      if (n % 5 === 0){
+        const s = await storageLeft();
+        if (s && s.quota && s.left < 300 * 1048576) stopRecording("App storage almost full. Recording stopped and saved.");
+      }
+    }).catch(err => { recSay("Save error: " + (err && err.message ? err.message : err)); });
   };
-  recorder2.ondataavailable = e => { if (e.data && e.data.size){ recChunks2.push(e.data); recBytes += e.data.size; $("stSize").textContent = (recBytes / 1048576).toFixed(0); } };
-  const thisLog = segLog;
-  recorder2.onstop = () => saveSegment(recChunks2, thisLog);
-  recorder2.onstart = () => {
+  const done = new Promise(r => { rec.onstop = r; });
+  rec.onstart = () => {
     segStartPerf = performance.now();
-    segStartWall = Date.now();
-    thisLog.startWall = new Date(segStartWall).toISOString();
-    if (lastFix) thisLog.gps.push({ t: 0, fixTime: segStartWall, lat: lastFix.latitude, lon: lastFix.longitude, alt: lastFix.altitude, acc: lastFix.accuracy, speed: lastFix.speed, heading: lastFix.heading, carried: true });
+    thisLog.startWall = new Date().toISOString();
+    if (lastFix) thisLog.gps.push({ t: 0, fixTime: Date.now(), lat: lastFix.latitude, lon: lastFix.longitude, alt: lastFix.altitude, acc: lastFix.accuracy, speed: lastFix.speed, heading: lastFix.heading, carried: true });
   };
-  recorder2.start(1000);
+  rec.start(CHUNK_MS);
+  recorder2 = rec;
+  // finish this part: wait for the last chunk, write timing, join chunks into one file
+  rec.finish = async () => {
+    if (rec.state !== "inactive") rec.stop();
+    await done;
+    await writeChain;
+    await writeFile(thisDir, "timing.json", JSON.stringify(thisLog));
+    await assemblePart(driveDir, partName);
+    refreshLibrary();
+  };
   const mins = parseInt($("recSplit").value) || 10;
   clearTimeout(segTimer);
-  segTimer = setTimeout(() => { if (recording){ recorder2.stop(); segIndex++; startSegment(); } }, mins * 60000);
+  segTimer = setTimeout(async () => {
+    if (!recording) return;
+    const old = recorder2;
+    segIndex++;
+    await startSegment();          // new part starts first so there is no gap
+    old.finish();
+  }, mins * 60000);
 }
 
-function saveSegment(chunks, log){
-  const ext = log.mime.indexOf("mp4") >= 0 ? "mp4" : "webm";
-  const base = "drive_" + log.drive + "_part" + pad(log.part);
-  const video = new Blob(chunks, { type: log.mime.split(";")[0] });
-  const json = new Blob([JSON.stringify(log, null, 1)], { type: "application/json" });
-  const add = (blob, name) => {
-    const a = document.createElement("a");
-    a.className = "save"; a.href = URL.createObjectURL(blob); a.download = name;
-    a.textContent = "Save " + name + " (" + (blob.size / 1048576).toFixed(1) + " MB)";
-    $("segList").appendChild(a);
-    a.click();
-  };
-  add(video, base + "." + ext);
-  add(json, base + "_timing.json");
-  segsSaved++;
-  $("stSeg").textContent = segsSaved;
+async function stopRecording(msg){
+  if (!recording || stopping) return;
+  stopping = true;
+  recording = false;
+  clearTimeout(segTimer); clearInterval(tickTimer);
+  recSay("Saving...");
+  try { if (recorder2) await recorder2.finish(); }
+  catch (e){ msg = "Save error: " + (e && e.message ? e.message : e); }
+  try { if (wakeLock) await wakeLock.release(); } catch (e) {}
+  wakeLock = null;
+  $("recBig").classList.remove("live");
+  $("recBig").textContent = "Record";
+  $("camBtn").disabled = false; $("recRes").disabled = false;
+  stopping = false;
+  recSay(msg || "Stopped and saved in the Library below.");
 }
 
 $("recBig").addEventListener("click", async () => {
-  if (!camStream) return;
-  if (!recording){
-    if (!recMime){ recSay("This browser cannot record video."); return; }
-    recording = true;
-    driveId = stamp(new Date()); segIndex = 0;
-    await grabWakeLock();
-    startSegment();
-    $("recBig").classList.add("live");
-    $("recBig").textContent = "Stop";
-    $("camBtn").disabled = true; $("recRes").disabled = true;
-    const t0 = performance.now();
-    tickTimer = setInterval(() => {
-      const s = Math.floor((performance.now() - t0) / 1000);
-      $("stTime").textContent = Math.floor(s / 60) + ":" + pad(s % 60);
-    }, 500);
-    recSay("");
-    $("recStatus").innerHTML = '<span class="dot"></span>Recording. Keep this screen open.';
-  } else {
-    recording = false;
-    clearTimeout(segTimer); clearInterval(tickTimer);
-    if (recorder2 && recorder2.state !== "inactive") recorder2.stop();
-    try { if (wakeLock) await wakeLock.release(); } catch (e) {}
-    wakeLock = null;
-    $("recBig").classList.remove("live");
-    $("recBig").textContent = "Record";
-    $("camBtn").disabled = false; $("recRes").disabled = false;
-    recSay("Stopped. Your files are saving to Downloads.");
-  }
+  if (!camStream || stopping) return;
+  if (recording){ stopRecording(); return; }
+  if (!recMime){ recSay("This browser cannot record video."); return; }
+  if (!navigator.storage || !navigator.storage.getDirectory){ recSay("This browser has no app storage for recordings."); return; }
+  if (battery && !battery.charging && battery.level * 100 <= (parseInt($("battStop").value) || 5)){ recSay("Battery is too low to start."); return; }
+  try { if (navigator.storage.persist) await navigator.storage.persist(); } catch (e) {}
+  recording = true;
+  driveId = stamp(new Date()); segIndex = 0;
+  await grabWakeLock();
+  try { await startSegment(); }
+  catch (e){ recording = false; recSay("Could not start: " + (e && e.message ? e.message : e)); return; }
+  $("recBig").classList.add("live");
+  $("recBig").textContent = "Stop";
+  $("camBtn").disabled = true; $("recRes").disabled = true;
+  const t0 = performance.now();
+  tickTimer = setInterval(() => {
+    const s = Math.floor((performance.now() - t0) / 1000);
+    $("stTime").textContent = Math.floor(s / 60) + ":" + pad(s % 60);
+    checkBattery();
+  }, 1000);
+  $("recStatus").innerHTML = '<span class="dot"></span>Recording. Saving into the app every few seconds. Keep this screen open.';
 });
+
+// ---------------- Library ----------------
+async function refreshLibrary(){
+  const list = $("libList");
+  if (!navigator.storage || !navigator.storage.getDirectory){ list.textContent = "This browser has no app storage."; return; }
+  let parts = [];
+  try {
+    const dd = await drivesDir();
+    for (const [dn, dh] of await listEntries(dd)){
+      if (dh.kind !== "directory") continue;
+      const entries = await listEntries(dh);
+      const names = entries.map(([n]) => n);
+      for (const [n, h] of entries){
+        if (h.kind !== "file" || !/^part\d+\.(webm|mp4)$/.test(n)) continue;
+        const f = await h.getFile();
+        const tname = n.replace(/\.(webm|mp4)$/, "_timing.json");
+        let gpsN = 0, speed = null;
+        if (names.includes(tname)){
+          try {
+            const t = JSON.parse(await (await (await dh.getFileHandle(tname)).getFile()).text());
+            gpsN = t.gps.length;
+            const sp = t.gps.map(g => g.speed).filter(x => x != null);
+            if (sp.length) speed = Math.round(sp.reduce((a, b) => a + b, 0) / sp.length * 2.23694);
+          } catch (e) {}
+        }
+        parts.push({ drive: dn, name: n, tname: names.includes(tname) ? tname : null, dir: dh, handle: h, size: f.size, gpsN, speed });
+      }
+      if (!entries.length) { try { await dd.removeEntry(dn); } catch (e) {} }
+    }
+  } catch (e){ list.textContent = "Could not read the library: " + e.message; return; }
+  parts.sort((a, b) => (b.drive + b.name).localeCompare(a.drive + a.name));
+  list.innerHTML = "";
+  if (!parts.length) list.innerHTML = '<p class="hint">No recordings yet.</p>';
+  for (const p of parts){
+    const d = document.createElement("div");
+    d.className = "lib";
+    d.innerHTML = '<div class="lib-top"><input type="checkbox"><b></b></div><div class="lib-sub"></div>' +
+      '<div class="btns"><button class="ghost" data-a="save">Save to phone</button><button class="ghost" data-a="del">Delete</button></div>';
+    d.querySelector("b").textContent = "Drive " + p.drive.replace("_", " ") + ", " + p.name.replace(/\.(webm|mp4)$/, "").replace("part", "part ");
+    d.querySelector(".lib-sub").textContent = mb(p.size) + (p.gpsN ? ", " + p.gpsN + " GPS points" : ", no GPS") + (p.speed != null ? ", avg " + p.speed + " mph" : "");
+    d.querySelector("input").libPart = p;
+    d.querySelector('[data-a="save"]').addEventListener("click", async () => {
+      const f = await p.handle.getFile();
+      const go = (blob, name) => { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); };
+      go(f, "drive_" + p.drive + "_" + p.name);
+      if (p.tname) go(await (await p.dir.getFileHandle(p.tname)).getFile(), "drive_" + p.drive + "_" + p.tname);
+    });
+    const del = d.querySelector('[data-a="del"]');
+    del.addEventListener("click", async () => {
+      if (del.dataset.armed !== "1"){ del.dataset.armed = "1"; del.textContent = "Tap again to delete"; setTimeout(() => { del.dataset.armed = ""; del.textContent = "Delete"; }, 3000); return; }
+      await p.dir.removeEntry(p.name);
+      if (p.tname) { try { await p.dir.removeEntry(p.tname); } catch (e) {} }
+      refreshLibrary();
+    });
+    list.appendChild(d);
+  }
+  const s = await storageLeft();
+  $("libStorage").textContent = s && s.quota ? "App storage: " + mb(s.used) + " used, " + mb(Math.max(0, s.left)) + " free." : "";
+}
+
+$("libUse").addEventListener("click", async () => {
+  const picked = [...document.querySelectorAll("#libList input[type=checkbox]:checked")].map(x => x.libPart);
+  if (!picked.length){ $("libStorage").textContent = "Check one or more parts first."; return; }
+  const files = [];
+  for (const p of picked){
+    const f = await p.handle.getFile();
+    files.push(new File([f], "drive_" + p.drive + "_" + p.name, { type: f.type }));
+  }
+  $("tabComp").click();
+  for (const x of document.querySelectorAll("#libList input[type=checkbox]")) x.checked = false;
+  await addClipFiles(files);
+});
+
+(async () => { await setupBattery(); await recoverParts(); await refreshLibrary(); })();
 </script>
 </body>
 </html>
