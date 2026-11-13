@@ -162,7 +162,7 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <section class="card">
 <h2>1. Clips</h2>
 <input id="files" type="file" accept="video/*" multiple>
-<p class="hint">Add parts from the Library above, or pick video files from the phone. The clip marked Base supplies the road.</p>
+<p class="hint">Add parts from the Library above, or pick video files from the phone. The clip marked Base supplies the road. One recording is enough: tap Copy this clip on it, then slide the copy's Start later so its cars land on the earlier road. If a clip looks sideways, set Turn so the road runs up the screen.</p>
 <div id="clipList"></div>
 </section>
 
@@ -264,6 +264,7 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <input id="roadFile" type="file" accept="video/*" style="margin-top:10px">
 <div class="grid" style="margin-top:10px">
 <label>Frames per second to track<select id="roadFps"><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+<label>Turn<select id="roadRot"><option value="0">as recorded</option><option value="90">a quarter right</option><option value="270">a quarter left</option><option value="180">upside down</option></select></label>
 <label>Lane width<select id="laneFt"><option value="12" selected>12 feet (highway)</option><option value="11">11 feet</option><option value="10">10 feet (city)</option></select></label>
 </div>
 <div class="btns"><button id="roadGo">Track road</button></div>
@@ -420,7 +421,7 @@ async function addClipFiles(list){
   for (const c of clips) await drawThumb(c);
   updateAlign();
   $("buildBtn").disabled = clips.length < 2;
-  setStatus(clips.length < 2 ? "Add at least one more clip." : clips.length + " clips ready.");
+  setStatus(clips.length < 2 ? "Add another clip, or tap Copy this clip to stack a recording with itself." : clips.length + " clips ready.");
 }
 
 async function drawThumb(c){
@@ -446,10 +447,23 @@ function renderClips(){
       '<label><input type="radio" name="base"' + (i === baseIdx ? " checked" : "") + '> Base</label></div>' +
       '<div class="vslot" style="margin-top:8px"></div>' +
       '<div class="row"><span style="font-size:14px">Start</span><input type="range" min="0" max="' + Math.max(0, dur - 0.1).toFixed(1) + '" step="0.1" value="' + c.offset + '"><span class="num">' + c.offset.toFixed(1) + 's</span></div>' +
-      '<div class="hint">Length ' + dur.toFixed(1) + "s</div>";
+      '<div class="hint">Length ' + dur.toFixed(1) + "s</div>" +
+      '<div class="row" style="flex-wrap:wrap"><label style="font-size:14px">Turn <select class="trig rot"><option value="0">as recorded</option><option value="90">a quarter right</option><option value="270">a quarter left</option><option value="180">upside down</option></select></label>' +
+      '<button class="ghost copyBtn" style="padding:6px 10px;font-size:14px">Copy this clip</button><button class="ghost rmBtn" style="padding:6px 10px;font-size:14px">Remove</button></div>';
     d.querySelector(".name").textContent = "Clip " + (i + 1) + ": " + c.name;
-    d.querySelector(".vslot").appendChild(c.video);
+    const slot = d.querySelector(".vslot");
+    slot.appendChild(c.video);
     c.thumb = c.video;
+    fitRot(c, slot);
+    const rotSel = d.querySelector("select.rot");
+    rotSel.value = String(c.rot || 0);
+    rotSel.addEventListener("change", () => {
+      c.rot = parseInt(rotSel.value) || 0;
+      fitRot(c, slot);
+      updateAlign();
+    });
+    d.querySelector(".copyBtn").addEventListener("click", () => copyClip(c));
+    d.querySelector(".rmBtn").addEventListener("click", () => removeClip(i));
     c.range = d.querySelector("input[type=range]");
     c.num = d.querySelector(".num");
     d.querySelector("input[type=radio]").addEventListener("change", () => {
@@ -467,6 +481,51 @@ function renderClips(){
     });
     wrap.appendChild(d);
   });
+}
+
+// Shows the preview video turned the way the clip is set.
+function fitRot(c, slot){
+  const v = c.video, r = c.rot || 0;
+  if (!r){ slot.style.cssText = "margin-top:8px"; v.style.cssText = ""; return; }
+  const [rw, rh] = rotDims(c);
+  slot.style.cssText = "margin-top:8px;position:relative;width:100%;overflow:hidden;border-radius:6px;background:#e9e5dc;aspect-ratio:" + (rw / rh).toFixed(4);
+  requestAnimationFrame(() => {
+    const W = slot.clientWidth, H = slot.clientHeight;
+    const sideways = r % 180 !== 0;
+    v.style.cssText = "position:absolute;left:50%;top:50%;max-height:none;border-radius:0;" +
+      "width:" + (sideways ? H : W) + "px;height:" + (sideways ? W : H) + "px;object-fit:contain;" +
+      "transform:translate(-50%,-50%) rotate(" + r + "deg)";
+  });
+}
+
+// The same recording can be stacked on itself: a copy starts later, so its cars land on the earlier road.
+async function copyClip(c){
+  setStatus("Copying clip...");
+  try {
+    const v = await loadClip(c.file);
+    const dur = v.duration || 0;
+    const off = Math.round(Math.min(Math.max(0, dur - 1), c.offset + Math.max(2, dur / 3)) * 10) / 10;
+    clips.push({ id: nextClipId++, file: c.file, mounted: null, name: c.name + " (copy)", video: v, offset: off, rot: c.rot || 0, enabled: true, thumb: null, range: null, num: null });
+    selectedIdx = clips.length - 1;
+    renderClips();
+    for (const cc of clips) await drawThumb(cc);
+    updateAlign();
+    $("buildBtn").disabled = clips.length < 2;
+    setStatus(clips.length + " clips ready. The copy starts " + off.toFixed(1) + "s in. Slide its Start to pick which moment's cars to borrow.");
+  } catch (e){ setStatus("Could not copy: " + e.message); }
+}
+
+function removeClip(i){
+  const c = clips[i];
+  try { c.video.pause(); c.video.remove(); } catch (e) {}
+  clips.splice(i, 1);
+  if (baseIdx >= clips.length || baseIdx === i) baseIdx = 0;
+  else if (baseIdx > i) baseIdx--;
+  selectedIdx = clips.length > 1 ? (baseIdx === 0 ? 1 : 0) : -1;
+  renderClips();
+  $("buildBtn").disabled = clips.length < 2;
+  setStatus(clips.length < 2 ? "Add another clip, or tap Copy this clip to stack a recording with itself." : clips.length + " clips ready.");
+  if (clips.length) updateAlign(); else $("alignCard").hidden = true;
 }
 
 // Line up view: flips between the base frame and the selected clip, or blends them.
@@ -520,7 +579,7 @@ async function updateAlign(){
         const b = await grabFrame(other, other.offset, W, H);
         alignB.getContext("2d").drawImage(b, 0, 0); b.close();
       }
-      if (!busy) setStatus(clips.length + " clips ready.");
+      if (!busy) setStatus(clips.length < 2 ? "Add another clip, or tap Copy this clip to stack a recording with itself." : clips.length + " clips ready.");
     } catch (err){ setStatus("Could not read frames: " + (err && err.message ? err.message : err)); }
     $("alignCard").hidden = false;
     paintAlign();
@@ -646,9 +705,19 @@ function ffRun(job){
   return p;
 }
 
+// a clip turned a quarter turn swaps its width and height
+function rotDims(c){
+  const vw = c.video.videoWidth, vh = c.video.videoHeight;
+  return (c.rot || 0) % 180 ? [vh, vw] : [vw, vh];
+}
 function evenSize(w, c){
-  let h = Math.round(w * c.video.videoHeight / c.video.videoWidth) || Math.round(w * 9 / 16);
+  const [vw, vh] = rotDims(c);
+  let h = Math.round(w * vh / vw) || Math.round(w * 9 / 16);
   return h - (h % 2);
+}
+function rotFilter(c){
+  const r = c.rot || 0;
+  return r === 90 ? "transpose=1," : r === 270 ? "transpose=2," : r === 180 ? "hflip,vflip," : "";
 }
 
 // One frame from a clip at time t, as an ImageBitmap of size w by h.
@@ -656,7 +725,7 @@ function grabFrame(c, t, w, h){
   return ffRun(async () => {
     const path = await clipPath(c);
     const out = "/grab.jpg";
-    await ff.exec(["-ss", Math.max(0, t).toFixed(3), "-i", path, "-frames:v", "1", "-vf", "scale=" + w + ":" + h, "-q:v", "3", "-y", out]);
+    await ff.exec(["-ss", Math.max(0, t).toFixed(3), "-i", path, "-frames:v", "1", "-vf", rotFilter(c) + "scale=" + w + ":" + h, "-q:v", "3", "-y", out]);
     const data = await ff.readFile(out);
     try { await ff.deleteFile(out); } catch (e) {}
     return createImageBitmap(new Blob([data], { type: "image/jpeg" }));
@@ -670,7 +739,7 @@ function grabRange(c, t, dur, fps, w, h){
     const dir = "/run" + c.id;
     try { await ff.createDir(dir); } catch (e) {}
     for (const e of await ff.listDir(dir)) if (!e.isDir) { try { await ff.deleteFile(dir + "/" + e.name); } catch (x) {} }
-    await ff.exec(["-ss", Math.max(0, t).toFixed(3), "-i", path, "-t", dur.toFixed(3), "-vf", "fps=" + fps + ",scale=" + w + ":" + h, "-q:v", "3", "-y", dir + "/f%05d.jpg"]);
+    await ff.exec(["-ss", Math.max(0, t).toFixed(3), "-i", path, "-t", dur.toFixed(3), "-vf", "fps=" + fps + "," + rotFilter(c) + "scale=" + w + ":" + h, "-q:v", "3", "-y", dir + "/f%05d.jpg"]);
     const names = (await ff.listDir(dir)).filter(e => !e.isDir).map(e => e.name).sort();
     const out = [];
     for (const n of names){
@@ -1948,8 +2017,8 @@ $("roadGo").addEventListener("click", async () => {
   try {
     const meta = await videoMeta(file);
     const fps = parseInt($("roadFps").value) || 4;
-    const H = Math.round(RW * meta.h / meta.w / 2) * 2;
-    const clip = { id: nextClipId++, file, mounted: null, video: { videoWidth: meta.w, videoHeight: meta.h } };
+    const clip = { id: nextClipId++, file, mounted: null, rot: parseInt($("roadRot").value) || 0, video: { videoWidth: meta.w, videoHeight: meta.h } };
+    const H = evenSize(RW, clip);
     $("roadStatus").textContent = "Pulling frames...";
     $("roadBar").style.width = "5%";
     // pull in chunks of 20 seconds so memory stays low on long recordings
