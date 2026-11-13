@@ -125,7 +125,8 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <div id="recView" hidden>
 <section class="card">
 <h2>Record a drive</h2>
-<video id="recPreview" muted playsinline autoplay></video>
+<div id="recSlot"><video id="recPreview" muted playsinline autoplay></video></div>
+<div class="status" id="orientLine" style="margin-top:6px">Which way is up: waiting for the camera.</div>
 <div class="stats">
 <div class="stat"><b id="stSpeed">0</b><span>mph</span></div>
 <div class="stat"><b id="stTime">0:00</b><span>recording</span></div>
@@ -137,6 +138,7 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 </div>
 <div class="grid" style="margin-top:10px">
 <label>Quality<select id="recRes"><option value="1280x720">720p</option><option value="1920x1080" selected>1080p</option></select></label>
+<label>Turn recordings<select id="recTurn"><option value="auto" selected>automatic from the phone's tilt</option><option value="0">as the camera sees</option><option value="90">a quarter right</option><option value="270">a quarter left</option><option value="180">upside down</option></select></label>
 <label>Capture style<select id="capMode"><option value="video" selected>Full video</option><option value="stills">Stop motion</option><option value="both">Both at once</option></select></label>
 <label>Stop motion frame every<select id="stillEvery"><option value="d10">10 feet</option><option value="d25" selected>25 feet</option><option value="d50">50 feet</option><option value="d100">100 feet</option><option value="d250">250 feet</option><option value="t0.5">half second</option><option value="t1">1 second</option><option value="t2">2 seconds</option><option value="t5">5 seconds</option></select></label>
 <label>Split into parts every<select id="recSplit"><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="20">20 minutes</option></select></label>
@@ -413,7 +415,7 @@ async function addClipFiles(list){
   for (const f of list){
     try {
       const v = await loadClip(f);
-      clips.push({ id: nextClipId++, file: f, mounted: null, name: f.name, video: v, offset: 0, enabled: true, thumb: null, range: null, num: null });
+      clips.push({ id: nextClipId++, file: f, mounted: null, name: f.name, video: v, offset: 0, rot: f._rot || 0, enabled: true, thumb: null, range: null, num: null });
     } catch (err){ setStatus(err.message); }
   }
   if (selectedIdx < 0 && clips.length > 1) selectedIdx = baseIdx === 0 ? 1 : 0;
@@ -1256,7 +1258,64 @@ async function storageLeft(){
   catch (e){ return null; }
 }
 
+// ---- which way is up ----
+// The phone's gravity sensor says which edge of the phone points at the sky. The camera hands over
+// frames in the phone's upright (portrait) layout, so the turn needed to stand the road up follows from that.
+let grav = { x: 0, y: 0, n: 0 }, gravOn = false, autoRot = 0, gravSeen = false;
+function onMotion(e){
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null) return;
+  gravSeen = true;
+  grav.x = grav.x * 0.9 + a.x * 0.1;
+  grav.y = grav.y * 0.9 + a.y * 0.1;
+  grav.n++;
+}
+async function startGravity(){
+  if (gravOn) return;
+  try { if (window.DeviceMotionEvent && DeviceMotionEvent.requestPermission) await DeviceMotionEvent.requestPermission(); } catch (e) {}
+  window.addEventListener("devicemotion", onMotion);
+  gravOn = true;
+}
+function screenAngle(){ try { return (screen.orientation && screen.orientation.angle) || window.orientation || 0; } catch (e){ return 0; } }
+// turn needed for frames laid out the way the phone is held upright
+function computeAutoRot(){
+  const st = camStream ? camStream.getVideoTracks()[0].getSettings() : {};
+  const landscapeFrames = (st.width || 0) > (st.height || 0);
+  let rot = 0;
+  if (gravSeen && Math.hypot(grav.x, grav.y) > 3){
+    // which phone edge points up: +y top edge, -y bottom edge, +x right edge, -x left edge
+    if (Math.abs(grav.x) > Math.abs(grav.y)) rot = grav.x > 0 ? 270 : 90;
+    else rot = grav.y > 0 ? 0 : 180;
+  }
+  // when the browser rotated the screen, its angle settles which side is which
+  const sa = screenAngle();
+  if (sa === 90) rot = 270; else if (sa === 270 || sa === -90) rot = 90;
+  // frames already handed over sideways-wide mean the browser turned them itself
+  if (landscapeFrames && (rot === 90 || rot === 270)) rot = 0;
+  return rot;
+}
+function recRot(){ const v = $("recTurn").value; return v === "auto" ? autoRot : parseInt(v) || 0; }
+const ROT_WORDS = { 0: "no turn needed", 90: "turning a quarter right", 270: "turning a quarter left", 180: "turning upside down" };
+let orientTimer = null;
+function watchOrientation(){
+  clearInterval(orientTimer);
+  orientTimer = setInterval(() => {
+    if (!camStream) return;
+    if (!recording) autoRot = computeAutoRot();   // hold the turn steady once recording starts
+    const r = recRot();
+    const how = $("recTurn").value === "auto" ? (gravSeen || screenAngle() ? "from the phone's tilt" : "no tilt reading yet, so none") : "set by hand";
+    $("orientLine").textContent = "Which way is up: " + ROT_WORDS[r] + " (" + how + "). The preview shows how it will come out.";
+    const pseudo = { video: $("recPreview"), rot: r };
+    if ($("recPreview")._rot !== r){ $("recPreview")._rot = r; fitRot(pseudo, $("recSlot")); }
+    if (segLog) segLog.rot = r;
+    if (stillsLog) stillsLog.rot = r;
+  }, 700);
+}
+$("recTurn").addEventListener("change", () => { $("recPreview")._rot = -1; });
+window.addEventListener("resize", () => { if (camStream){ $("recPreview")._rot = -1; } });
+
 $("camBtn").addEventListener("click", async () => {
+  startGravity();
   if (camStream){ for (const t of camStream.getTracks()) t.stop(); camStream = null; }
   const [w, h] = $("recRes").value.split("x").map(Number);
   try {
@@ -1266,6 +1325,8 @@ $("camBtn").addEventListener("click", async () => {
     });
   } catch (e){ recSay("Camera blocked: " + (e && e.message ? e.message : e)); return; }
   $("recPreview").srcObject = camStream;
+  $("recPreview")._rot = -1;
+  watchOrientation();
   const st = camStream.getVideoTracks()[0].getSettings();
   recSay("Camera on at " + (st.width || "?") + "x" + (st.height || "?") + ", " + Math.round(st.frameRate || 0) + " fps. Starting GPS...");
   startGeo();
@@ -1309,7 +1370,7 @@ async function startSegment(){
   chunkNo = 0; recBytes = 0;
   const [w] = $("recRes").value.split("x").map(Number);
   const st = camStream.getVideoTracks()[0].getSettings();
-  segLog = { drive: driveId, part: segIndex + 1, mime: recMime, width: st.width, height: st.height, fps: st.frameRate, startWall: null, gps: [] };
+  segLog = { drive: driveId, part: segIndex + 1, mime: recMime, width: st.width, height: st.height, fps: st.frameRate, rot: recRot(), rotSource: $("recTurn").value === "auto" ? "tilt" : "hand", startWall: null, gps: [] };
   await writeFile(segDir, "meta.json", JSON.stringify({ mime: recMime }));
   const thisDir = segDir, thisLog = segLog;
   const rec = new MediaRecorder(camStream, { mimeType: recMime, videoBitsPerSecond: w >= 1920 ? 8000000 : 5000000 });
@@ -1432,7 +1493,7 @@ async function startStills(t0){
   const every = $("stillEvery").value;
   const byDist = every[0] === "d";
   const step = parseFloat(every.slice(1)) * (byDist ? 0.3048 : 1); // meters or seconds
-  stillsLog = { drive: driveId, mode: byDist ? "distance" : "time", every: every, stepMeters: byDist ? step : null, stepSeconds: byDist ? null : step, startWall: new Date().toISOString(), frames: [] };
+  stillsLog = { drive: driveId, rot: recRot(), mode: byDist ? "distance" : "time", every: every, stepMeters: byDist ? step : null, stepSeconds: byDist ? null : step, startWall: new Date().toISOString(), frames: [] };
   stillN = 0; stillDist = 0; stillLastTick = performance.now(); stillLastAt = performance.now() - 1e9;
   $("stStills").textContent = "0";
   const thisDir = stillsDir, thisLog = stillsLog;
@@ -1520,18 +1581,19 @@ async function scanLibrary(){
         if (h.kind !== "file" || !/^part\d+\.(webm|mp4)$/.test(n)) continue;
         const f = await h.getFile();
         const tname = n.replace(/\.(webm|mp4)$/, "_timing.json");
-        let gpsN = 0, speed = null, track = [];
+        let gpsN = 0, speed = null, track = [], rot = 0;
         if (names.includes(tname)){
           try {
             const t = JSON.parse(await (await (await dh.getFileHandle(tname)).getFile()).text());
             gpsN = t.gps.length;
+            rot = t.rot || 0;
             track = t.gps.filter(g => g.lat != null && !g.carried).map(g => [g.lat, g.lon]);
             if (!track.length) track = t.gps.filter(g => g.lat != null).map(g => [g.lat, g.lon]);
             const sp = t.gps.map(g => g.speed).filter(x => x != null);
             if (sp.length) speed = Math.round(sp.reduce((a, b) => a + b, 0) / sp.length * 2.23694);
           } catch (e) {}
         }
-        parts.push({ kind: "video", drive: dn, name: n, tname: names.includes(tname) ? tname : null, dir: dh, handle: h, size: f.size, gpsN, speed, track, id: dn + "/" + n });
+        parts.push({ kind: "video", drive: dn, name: n, tname: names.includes(tname) ? tname : null, dir: dh, handle: h, size: f.size, gpsN, speed, track, rot, id: dn + "/" + n });
       }
       const st = entries.find(([n, h]) => n === "stills" && h.kind === "directory");
       if (st){
@@ -1542,7 +1604,7 @@ async function scanLibrary(){
         }
         try { info = JSON.parse(await (await (await st[1].getFileHandle("stills.json")).getFile()).text()); } catch (e) {}
         const track = info && info.frames ? info.frames.filter(f => f.lat != null).map(f => [f.lat, f.lon]) : [];
-        if (count) parts.push({ kind: "stills", drive: dn, name: "stills", dir: st[1], parentDir: dh, size, count, info, track, id: dn + "/stills" });
+        if (count) parts.push({ kind: "stills", drive: dn, name: "stills", dir: st[1], parentDir: dh, size, count, info, track, rot: (info && info.rot) || 0, id: dn + "/stills" });
       }
       if (!entries.length) { try { await dd.removeEntry(dn); } catch (e) {} }
     }
@@ -1625,10 +1687,14 @@ async function useInComposite(picked, btn, say){
     for (const p of picked){
       if (p.kind === "stills"){
         say("Building stop motion video for drive " + p.drive + "...");
-        files.push(await stillsToVideo(p, parseInt($("stillFps").value) || 8));
+        const sf = await stillsToVideo(p, parseInt($("stillFps").value) || 8);
+        sf._rot = p.rot || 0;
+        files.push(sf);
       } else {
         const f = await p.handle.getFile();
-        files.push(new File([f], "drive_" + p.drive + "_" + p.name, { type: f.type }));
+        const vf = new File([f], "drive_" + p.drive + "_" + p.name, { type: f.type });
+        vf._rot = p.rot || 0;
+        files.push(vf);
       }
     }
   } catch (e){ say("Could not load: " + e.message); btn.disabled = false; return; }
@@ -1811,7 +1877,13 @@ async function openRoad(){
   const o0 = document.createElement("option"); o0.value = ""; o0.textContent = roadItems.length ? "Pick a recording from the Library" : "No recordings in the Library yet"; sel.appendChild(o0);
   roadItems.forEach((p, i) => { const o = document.createElement("option"); o.value = String(i); o.textContent = itemLabel(p); sel.appendChild(o); });
 }
-$("roadPick").addEventListener("change", () => { if ($("roadPick").value !== "") $("roadFile").value = ""; });
+$("roadPick").addEventListener("change", () => {
+  if ($("roadPick").value !== ""){
+    $("roadFile").value = "";
+    const it = roadItems[parseInt($("roadPick").value)];
+    if (it) $("roadRot").value = String(it.rot || 0);
+  }
+});
 $("roadFile").addEventListener("change", () => { if ($("roadFile").files.length) $("roadPick").value = ""; });
 
 function videoMeta(file){
