@@ -44,7 +44,7 @@ canvas{width:100%;height:auto;display:block;border-radius:8px;background:#e9e5dc
 a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 .tabs{display:flex;gap:8px;margin:0 0 14px}
 .tabs{flex-wrap:wrap}
-.tabs button{flex:1;background:#fff;color:var(--accent);padding:10px 6px;min-width:64px}
+.tabs button{flex:1 1 auto;background:#fff;color:var(--accent);padding:10px 8px;font-size:15px}
 .tabs button.on{background:var(--accent);color:var(--accent-ink)}
 #recPreview{width:100%;display:block;border-radius:8px;background:#e9e5dc;max-height:55vh;object-fit:contain}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
@@ -61,7 +61,6 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 .tag{display:inline-block;font-size:12px;font-weight:700;padding:2px 8px;border-radius:20px;margin-right:6px;vertical-align:middle}
 .tag.v{background:#e3eef3;color:#1f6f8b}
 .tag.s{background:var(--soft);color:#a8480f}
-#recBig{width:100%;font-size:20px;padding:16px}
 #recBig.live{background:#b3261e;border-color:#b3261e}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#b3261e;margin-right:6px;animation:blink 1s infinite}
 @keyframes blink{50%{opacity:.2}}
@@ -92,6 +91,15 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 .arow span{flex:1;font-size:15px}
 .arow select{font-size:15px;padding:6px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink)}
 .fl small{display:block;font-weight:600;font-size:11px;letter-spacing:0;margin-top:2px;opacity:.85}
+.recbar{display:flex;gap:8px;margin-top:8px}
+.recbar button{flex:1;padding:14px 10px;font-size:18px}
+.recbar #recBig{flex:2}
+.recbar #recBig.live{background:#b3261e;border-color:#b3261e}
+.card.foldable > h2{cursor:pointer;display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;user-select:none}
+.card.foldable > h2::after{content:"\25BE";font-size:20px;color:var(--accent);transition:transform .15s}
+.card.foldable.folded > h2{margin-bottom:0}
+.card.foldable.folded > h2::after{transform:rotate(-90deg)}
+.card.foldable.folded > :not(h2){display:none !important}
 </style>
 </head>
 <body>
@@ -126,8 +134,14 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <section class="card">
 <h2>Record a drive</h2>
 <div id="recSlot"><video id="recPreview" muted playsinline autoplay></video></div>
-<div class="status" id="orientLine" style="margin-top:6px">Which way is up: waiting for the camera.</div>
-<div class="stats">
+<div class="recbar"><button id="camBtn" class="ghost">Start camera</button><button id="recBig" disabled>Record</button></div>
+<div class="status" id="recStatus">Mount the phone in the same spot every drive, then tap Start camera.</div>
+<div class="status" id="orientLine" style="margin-top:2px">Which way is up: waiting for the camera.</div>
+</section>
+
+<section class="card" data-fold="open">
+<h2>Live readings</h2>
+<div class="stats" style="margin-top:0">
 <div class="stat"><b id="stSpeed">0</b><span>mph</span></div>
 <div class="stat"><b id="stTime">0:00</b><span>recording</span></div>
 <div class="stat"><b id="stGps">none</b><span>GPS accuracy</span></div>
@@ -136,7 +150,11 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <div class="stat"><b id="stSize">0</b><span>MB this part</span></div>
 <div class="stat"><b id="stBatt">?</b><span>battery</span></div>
 </div>
-<div class="grid" style="margin-top:10px">
+</section>
+
+<section class="card" data-fold="closed">
+<h2>Recording settings</h2>
+<div class="grid">
 <label>Quality<select id="recRes"><option value="1280x720">720p</option><option value="1920x1080" selected>1080p</option></select></label>
 <label>Turn recordings<select id="recTurn"><option value="auto" selected>automatic from the phone's tilt</option><option value="0">as the camera sees</option><option value="90">a quarter right</option><option value="270">a quarter left</option><option value="180">upside down</option></select></label>
 <label>Capture style<select id="capMode"><option value="video" selected>Full video</option><option value="stills">Stop motion</option><option value="both">Both at once</option></select></label>
@@ -144,14 +162,11 @@ a.save{display:inline-block;margin-top:10px;color:var(--accent);font-weight:600}
 <label>Split into parts every<select id="recSplit"><option value="5">5 minutes</option><option value="10" selected>10 minutes</option><option value="20">20 minutes</option></select></label>
 <label>Stop when battery reaches<select id="battStop"><option value="5" selected>5%</option><option value="10">10%</option><option value="15">15%</option></select></label>
 </div>
-<div class="btns"><button id="camBtn" class="ghost">Start camera</button></div>
-<div class="btns"><button id="recBig" disabled>Record</button></div>
-<div class="status" id="recStatus">Mount the phone sideways in the same spot every drive, then tap Start camera.</div>
-<p class="hint">Recordings save inside the app every few seconds, so a crash or reload keeps everything up to that moment. Each part keeps its GPS, speed and heading tied to the video's clock.</p>
+<p class="hint">Recordings save inside the app every few seconds, so a crash or reload keeps everything up to that moment. Each part keeps its GPS, speed, heading and which way is up, tied to the video's clock.</p>
 </section>
 </div>
 
-<section class="card">
+<section class="card" data-fold="open">
 <h2>Library</h2>
 <div class="status" id="libStorage" style="margin-top:0"></div>
 <div id="libList"></div>
@@ -2473,6 +2488,28 @@ async function refreshSongPicker(){
   if (songs.some(s => s.id === keep)) sel.value = keep;
 }
 refreshSongPicker();
+
+
+// ---- every card folds: tap its title to tuck it away; the phone remembers which are folded ----
+(function(){
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem("folded") || "{}"); } catch (e) {}
+  document.querySelectorAll("section.card").forEach(card => {
+    const h = card.querySelector(":scope > h2");
+    if (!h) return;
+    const key = h.textContent.trim();
+    card.classList.add("foldable");
+    const start = key in saved ? saved[key] : card.dataset.fold === "closed";
+    card.classList.toggle("folded", !!start);
+    h.addEventListener("click", () => {
+      const f = !card.classList.contains("folded");
+      card.classList.toggle("folded", f);
+      saved[key] = f;
+      try { localStorage.setItem("folded", JSON.stringify(saved)); } catch (e) {}
+      if (!f && key.indexOf("Where") === 0 && typeof map !== "undefined" && map) setTimeout(() => map.invalidateSize(), 50);
+    });
+  });
+})();
 
 (async () => { await setupBattery(); await recoverParts(); await refreshLibrary(); })();
 </script>
